@@ -3,7 +3,7 @@ Current-step detection for patch-clamp sweeps.
 """
 from __future__ import annotations
 import numpy as np
-from .models import Recording, Sweep
+from models import Recording, Sweep
 
 def detect_steps(recording: Recording) -> None:
     """
