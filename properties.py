@@ -183,6 +183,7 @@ def compute_properties(recording: Recording) -> IntrinsicProperties:
                 fi_slope = float(slope) / step_duration  # (spikes/pA) / s = Hz/pA
 
     # --- Adaptation index: from the sweep with the most spikes ---
+    # --- Adaptation index: from the sweep with the most spikes ---
     adaptation = None
     richest = max(sweep_analyses, key=lambda a: a.n_spikes, default=None)
     if richest and richest.n_spikes >= 3:
