@@ -188,6 +188,48 @@ def compute_properties(recording: Recording) -> IntrinsicProperties:
     if richest and richest.n_spikes >= 3:
         adaptation = richest.adaptation_index
 
+def compute_phase_plane(time_ms, voltage_mv):
+    """
+    Computes dV/dt (V/s or mV/ms) against Voltage.
+    """
+    dt_s = np.gradient(time_ms) / 1000.0  # Convert ms to seconds
+    dv_dt = np.gradient(voltage_mv) / dt_s  # dV/dt in V/s (or mV/ms)
+    return voltage_mv, dv_dt
+
+
+def analyze_fahp(time_ms, voltage_mv, spike_peak_idx, v_rest, next_spike_idx=None, max_fahp_window_ms=20.0):
+    """
+    Calculates fAHP amplitude (V_rest - V_min) ensuring no intervening spike within the window.
+    """
+    dt = time_ms[1] - time_ms[0]
+    max_pts = int(max_fahp_window_ms / dt)
+    
+    # Define search window for trough
+    start_idx = spike_peak_idx
+    if next_spike_idx is not None:
+        end_idx = min(start_idx + max_pts, next_spike_idx)
+        # Check uninterrupted condition: exclude if subsequent spike occurs < 20 ms
+        if (time_ms[next_spike_idx] - time_ms[spike_peak_idx]) < max_fahp_window_ms:
+            return None
+    else:
+        end_idx = min(start_idx + max_pts, len(voltage_mv))
+        
+    post_spike_v = voltage_mv[start_idx:end_idx]
+    if len(post_spike_v) == 0:
+        return None
+        
+    trough_idx = start_idx + np.argmin(post_spike_v)
+    v_min = voltage_mv[trough_idx]
+    fahp_amplitude = v_rest - v_min  # Depolarization/Hyperpolarization relative to baseline
+    fahp_duration = time_ms[trough_idx] - time_ms[spike_peak_idx]
+
+    return {
+        "v_min": v_min,
+        "fahp_amplitude": fahp_amplitude,
+        "fahp_duration_ms": fahp_duration,
+        "trough_idx": trough_idx
+    }
+
     return IntrinsicProperties(
         resting_membrane_potential=rmp,
         input_resistance=input_resistance,
