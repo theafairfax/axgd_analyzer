@@ -4,7 +4,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 from models import Metadata, Recording
-from io import load_axgd_bytes
+from axgd_io import load_axgd_bytes
 from properties import compute_properties
 
 st.set_page_config(page_title="AxoGraph Patch-Clamp Analyzer", layout="wide")
