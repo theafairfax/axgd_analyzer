@@ -3,7 +3,7 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 
-from models import Metadata, Recording
+from models import Metadata, Recording, Sweep
 from axgd_io import load_axgd_bytes
 from properties import compute_properties
 
