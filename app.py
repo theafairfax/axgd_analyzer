@@ -42,6 +42,49 @@ condition = st.sidebar.text_input("Condition / Genotype", value="WT")
 cell_type = st.sidebar.text_input("Cell Type", value="Pyramidal")
 notes = st.sidebar.text_area("Notes", value="")
 
+with st.sidebar:
+    st.header("Plot & Calculation Settings")
+    
+    # Pass-through parameter for calculation (e.g., threshold or filter cutoff)
+    calc_param = st.number_input(
+        "Calculation Parameter (e.g. Sampling Rate / Threshold)",
+        min_value=1.0,
+        value=10000.0,
+        step=100.0
+    )
+    
+    st.subheader("Phase Plot mV Axis")
+    manual_phase_range = st.checkbox("Manual mV Range for Phase Plot", value=False)
+    
+    if manual_phase_range:
+        phase_vmin = st.number_input("Phase V Min (mV)", value=-90.0, step=5.0)
+        phase_vmax = st.number_input("Phase V Max (mV)", value=50.0, step=5.0)
+        phase_xlim = (phase_vmin, phase_vmax)
+    else:
+        phase_xlim = None
+
+def run_calculations(raw_time_sec, raw_voltage_mv, param):
+    """
+    Downstream processing using the passed sidebar parameter.
+    Converts time axis from seconds to milliseconds.
+    """
+    # Convert seconds -> milliseconds
+    time_ms = raw_time_sec * 1000.0
+    
+    # Calculate dV/dt (V/s or mV/ms)
+    # Using sampling interval from converted time
+    dt_ms = np.gradient(time_ms)
+    dv_dt = np.gradient(raw_voltage_mv) / (dt_ms / 1000.0)  # in V/s or mV/ms depending on scaling
+    
+    # Example computation using the passed sidebar input
+    metrics = {
+        "max_dvdt": np.max(dv_dt),
+        "min_dvdt": np.min(dv_dt),
+        "adjusted_stat": np.mean(raw_voltage_mv) * (param / 1000.0)
+    }
+    
+    return time_ms, raw_voltage_mv, dv_dt, metrics
+
 if uploaded_file is not None:
     meta = Metadata(
         cell_id=cell_id,
@@ -105,7 +148,7 @@ if uploaded_file is not None:
                 ax_v.grid(True, linestyle="--", alpha=0.5)
 
                 ax_i.set_ylabel("Current (pA)")
-                ax_i.set_xlabel("Time (s)")
+                ax_i.set_xlabel("Time (ms)")
                 ax_i.grid(True, linestyle="--", alpha=0.5)
 
                 st.pyplot(fig)
