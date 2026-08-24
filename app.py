@@ -16,9 +16,11 @@ def _load_data(file_bytes: bytes, filename: str, metadata: Metadata) -> Recordin
     return rec
 
 
-def plot_phase_plane(voltage_mv, dv_dt, spike_ranges=None):
+def plot_phase_plane(voltage_mv, dv_dt, spike_ranges=None, xlim=None):
     fig, ax = plt.subplots(figsize=(5, 4))
     ax.plot(voltage_mv, dv_dt, color="crimson", lw=1.2)
+    if xlim is not None:
+        ax.set_xlim(xlim)
     ax.set_xlabel(r"Membrane Potential ($V$, mV)")
     ax.set_ylabel(r"$\mathrm{d}V/\mathrm{d}t$ (V/s)")
     ax.set_title("Action Potential Phase Plot")
@@ -243,7 +245,7 @@ if uploaded_file is not None:
 
             with col1:
                 v_trace, dvdt_trace = compute_phase_plane(sweep_time, sweep_voltage)
-                fig_phase = plot_phase_plane(v_trace, dvdt_trace)
+                fig_phase = plot_phase_plane(v_trace, dvdt_trace, xlim=phase_xlim)
                 st.pyplot(fig_phase)
                 plt.close(fig_phase)
 
