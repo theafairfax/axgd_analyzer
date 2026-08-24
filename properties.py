@@ -10,9 +10,9 @@ from typing import List, Optional
 import numpy as np
 from scipy.optimize import curve_fit
 
-from .models import Recording, Sweep, SweepAnalysis, IntrinsicProperties
-from .protocol import detect_steps
-from .spikes import detect_spikes, adaptation_index as _adaptation_index
+from models import Recording, Sweep, SweepAnalysis, IntrinsicProperties
+from protocol import detect_steps
+from spikes import detect_spikes, adaptation_index as _adaptation_index
 
 
 def _exp_decay(t, v_inf, delta, tau):
