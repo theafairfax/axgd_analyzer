@@ -13,7 +13,7 @@ from typing import List, Optional
 import numpy as np
 from scipy.signal import find_peaks
 
-from .models import Sweep, SpikeFeatures
+from models import Sweep, SpikeFeatures
 
 
 def detect_spikes(sweep: Sweep, min_peak_mv: float = -10.0,
