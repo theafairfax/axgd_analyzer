@@ -16,7 +16,7 @@ def _load_data(file_bytes: bytes, filename: str, metadata: Metadata) -> Recordin
     return rec
 
 
-def plot_phase_plane(voltage_mv, dv_dt, spike_ranges=None, xlim=None):
+def plot_phase_plane(voltage_mv, dv_dt, xlim=None):
     fig, ax = plt.subplots(figsize=(5, 4))
     ax.plot(voltage_mv, dv_dt, color="crimson", lw=1.2)
     if xlim is not None:
@@ -47,12 +47,12 @@ notes = st.sidebar.text_area("Notes", value="")
 with st.sidebar:
     st.header("Plot & Calculation Settings")
     
-    # Pass-through parameter for calculation (e.g., threshold or filter cutoff)
-    calc_param = st.number_input(
-        "Calculation Parameter (e.g. Sampling Rate / Threshold)",
+    ahp_window_ms = st.number_input(
+        "AHP Search Window (ms)",
         min_value=1.0,
-        value=10000.0,
-        step=100.0
+        max_value=200.0,
+        value=20.0,
+        step=1.0
     )
     
     st.subheader("Phase Plot mV Axis")
@@ -64,28 +64,6 @@ with st.sidebar:
         phase_xlim = (phase_vmin, phase_vmax)
     else:
         phase_xlim = None
-
-def run_calculations(raw_time_sec, raw_voltage_mv, param):
-    """
-    Downstream processing using the passed sidebar parameter.
-    Converts time axis from seconds to milliseconds.
-    """
-    # Convert seconds -> milliseconds
-    time_ms = raw_time_sec * 1000.0
-    
-    # Calculate dV/dt (V/s or mV/ms)
-    # Using sampling interval from converted time
-    dt_ms = np.gradient(time_ms)
-    dv_dt = np.gradient(raw_voltage_mv) / (dt_ms / 1000.0)  # in V/s or mV/ms depending on scaling
-    
-    # Example computation using the passed sidebar input
-    metrics = {
-        "max_dvdt": np.max(dv_dt),
-        "min_dvdt": np.min(dv_dt),
-        "adjusted_stat": np.mean(raw_voltage_mv) * (param / 1000.0)
-    }
-    
-    return time_ms, raw_voltage_mv, dv_dt, metrics
 
 if uploaded_file is not None:
     meta = Metadata(
@@ -141,9 +119,11 @@ if uploaded_file is not None:
                         if sw.step_amplitude is not None
                         else f"Sweep {idx}"
                     )
-                    ax_v.plot(sw.time, sw.voltage, label=label)
+                    # Convert seconds -> ms for plotting
+                    time_ms_trace = sw.time * 1000.0
+                    ax_v.plot(time_ms_trace, sw.voltage, label=label)
                     if sw.current is not None:
-                        ax_i.plot(sw.time, sw.current)
+                        ax_i.plot(time_ms_trace, sw.current)
 
                 ax_v.set_ylabel("Voltage (mV)")
                 ax_v.legend(loc="upper right", fontsize="small")
@@ -159,7 +139,7 @@ if uploaded_file is not None:
         # 2. F-I Curve Tab
         with tab_fi:
             st.subheader("Firing Frequency vs. Injected Current (F-I)")
-            if props and props.fi_curve:
+            if props is not None and len(props.fi_curve) > 0:
                 currents = [pt[0] for pt in props.fi_curve]
                 spikes = [pt[1] for pt in props.fi_curve]
 
@@ -193,11 +173,13 @@ if uploaded_file is not None:
                     st.metric("Rheobase", rheobase_str)
                     st.metric("F-I Slope", fi_slope_str)
                     st.metric("Max Firing Rate", max_fr_str)
+            else:
+                st.info("No F-I curve data could be generated for this recording.")
 
         # 3. Intrinsic Properties Summary Tab
         with tab_summary:
             st.subheader("Intrinsic Membrane & Action Potential Properties")
-            if props:
+            if props is not None:
                 flat_props = props.to_flat_dict()
                 df_props = pd.DataFrame(
                     list(flat_props.items()), columns=["Property", "Value"]
@@ -217,6 +199,8 @@ if uploaded_file is not None:
                     file_name=f"{rec.metadata.cell_id or 'cell'}_properties.csv",
                     mime="text/csv",
                 )
+            else:
+                st.info("No intrinsic properties available.")
 
         # 4. Action Potential Dynamics (Phase Plane & fAHP)
         with tab_ap:
@@ -234,29 +218,34 @@ if uploaded_file is not None:
             baseline_vrest = (
                 props.resting_membrane_potential
                 if props and props.resting_membrane_potential is not None
-                else np.mean(sweep_voltage[:100])
+                else float(np.mean(sweep_voltage[:100]))
             )
 
-            # Retrieve detected spikes if available on the sweep model
-            first_spike_idx = getattr(target_sweep, "first_spike_index", None)
-            second_spike_idx = getattr(target_sweep, "second_spike_index", None)
+            # Retrieve detected spikes from sweep_analyses
+            analysis = props.sweep_analyses[sweep_idx] if props and sweep_idx < len(props.sweep_analyses) else None
+            detected_spikes = analysis.spikes if analysis else []
 
             col1, col2 = st.columns(2)
 
             with col1:
-                v_trace, dvdt_trace = compute_phase_plane(sweep_time, sweep_voltage)
+                v_trace, dvdt_trace = compute_phase_plane(sweep_time * 1000.0, sweep_voltage)
                 fig_phase = plot_phase_plane(v_trace, dvdt_trace, xlim=phase_xlim)
                 st.pyplot(fig_phase)
                 plt.close(fig_phase)
 
             with col2:
-                if first_spike_idx is not None:
+                if len(detected_spikes) > 0:
+                    first_spike = detected_spikes[0]
+                    first_spike_idx = int(first_spike.peak_time * target_sweep.sampling_rate)
+                    second_spike_idx = int(detected_spikes[1].peak_time * target_sweep.sampling_rate) if len(detected_spikes) > 1 else None
+
                     fahp_results = analyze_fahp(
                         time_ms=sweep_time * 1000.0,
                         voltage_mv=sweep_voltage,
                         spike_peak_idx=first_spike_idx,
                         v_rest=baseline_vrest,
                         next_spike_idx=second_spike_idx,
+                        max_fahp_window_ms=ahp_window_ms,
                     )
 
                     if fahp_results:
@@ -274,10 +263,10 @@ if uploaded_file is not None:
                         )
                     else:
                         st.warning(
-                            "Spike excluded: Subsequent spike within 20 ms or no valid trough detected."
+                            f"Spike excluded: Subsequent spike within {ahp_window_ms:.0f} ms or no valid trough detected."
                         )
                 else:
-                    st.info("No action potential peak detected in the selected sweep.")
+                    st.info("No action potentials detected in this sweep.")
 
     except Exception as err:
         st.error(f"Error processing file: {err}")
