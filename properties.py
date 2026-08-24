@@ -189,6 +189,24 @@ def compute_properties(recording: Recording) -> IntrinsicProperties:
     if richest and richest.n_spikes >= 3:
         adaptation = richest.adaptation_index
 
+    return IntrinsicProperties(
+        resting_membrane_potential=rmp,
+        input_resistance=input_resistance,
+        membrane_tau=membrane_tau,
+        membrane_capacitance=membrane_capacitance,
+        sag_ratio=sag_ratio,
+        rheobase=rheobase,
+        first_spike_threshold=first_spike_threshold,
+        first_spike_amplitude=first_spike_amplitude,
+        first_spike_half_width=first_spike_half_width,
+        max_firing_rate_hz=max_firing_rate,
+        fi_slope=fi_slope,
+        adaptation_index=adaptation,
+        fi_curve=fi_curve,
+        sweep_analyses=sweep_analyses,
+    )
+
+
 def compute_phase_plane(time_ms, voltage_mv):
     """
     Computes dV/dt (V/s or mV/ms) against Voltage.
@@ -230,20 +248,3 @@ def analyze_fahp(time_ms, voltage_mv, spike_peak_idx, v_rest, next_spike_idx=Non
         "fahp_duration_ms": fahp_duration,
         "trough_idx": trough_idx
     }
-
-    return IntrinsicProperties(
-        resting_membrane_potential=rmp,
-        input_resistance=input_resistance,
-        membrane_tau=membrane_tau,
-        membrane_capacitance=membrane_capacitance,
-        sag_ratio=sag_ratio,
-        rheobase=rheobase,
-        first_spike_threshold=first_spike_threshold,
-        first_spike_amplitude=first_spike_amplitude,
-        first_spike_half_width=first_spike_half_width,
-        max_firing_rate_hz=max_firing_rate,
-        fi_slope=fi_slope,
-        adaptation_index=adaptation,
-        fi_curve=fi_curve,
-        sweep_analyses=sweep_analyses,
-    )
