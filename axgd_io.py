@@ -13,7 +13,7 @@ from typing import Tuple
 
 import numpy as np
 
-from .models import Recording, Sweep, Metadata
+from models import Recording, Sweep, Metadata
 
 try:
     import neo
