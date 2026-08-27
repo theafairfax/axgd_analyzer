@@ -1,20 +1,17 @@
-"""Dedicated analysis of the AxoGraph '0001 Test Pulse 1-Ch' protocol.
+"""Passive membrane analysis from AxoGraph test-pulse recordings.
 
-The acquired test-pulse files used in this project contain a single measured
-Current-1 channel while the protocol applies a small voltage-command pulse.
-Therefore Rs/Rm/Cm must be derived from the measured current transient, not
-from a current-injection step or a membrane-voltage transient.
+For voltage-clamp test pulses the measured current often contains a very fast
+pipette/electrode-capacitance artifact followed by the slower whole-cell
+membrane charging transient.  Using the absolute first current peak therefore
+systematically underestimates series resistance.  We separate those components
+with a biexponential fit and use the slower component for Rs/Rm/Cm.
 """
 from __future__ import annotations
-
 from dataclasses import dataclass, field
 from typing import Optional
-
 import numpy as np
 from scipy.optimize import curve_fit
-
 from models import Recording, Sweep
-
 
 @dataclass
 class TestPulseProperties:
@@ -24,154 +21,109 @@ class TestPulseProperties:
     n_valid_sweeps: int = 0
     sweep_values: list = field(default_factory=list)
     pulse_amplitude_mv: float = 10.0
-    pulse_width_ms: float = 20.0
 
 
-def _single_exp(t_ms, i_ss, amplitude, tau_ms):
-    return i_ss + amplitude * np.exp(-t_ms / tau_ms)
+def _double_exp(t, i_ss, a_fast, tau_fast, a_mem, tau_mem):
+    return i_ss + a_fast*np.exp(-t/tau_fast) + a_mem*np.exp(-t/tau_mem)
 
 
-def _find_test_pulse_window(signal: np.ndarray, fs: float):
-    """Find the first rectangular test pulse from the measured current trace.
+def _find_test_pulse_window(signal, fs):
+    """Find a pair of strong transitions separated by 5-80 ms.
 
-    The standard protocol begins near 20 ms and lasts ~20 ms, but derivative
-    detection is used so minor protocol timing changes remain supported.
+    Pair scoring fixes the prior failure mode where the larger pulse OFF
+    transition was incorrectly labeled as the onset.
     """
-    if len(signal) < 20 or fs <= 0:
-        return None, None
-    x = np.asarray(signal, dtype=float)
-    # lightly smooth before differentiating; preserves the fast charging peak
-    win = max(int(round(0.0001 * fs)), 1)
-    if win > 1:
-        kernel = np.ones(win) / win
-        smooth = np.convolve(x, kernel, mode="same")
-    else:
-        smooth = x
-    d = np.abs(np.diff(smooth))
-    # Ignore the outer 2 ms where edge artifacts can dominate.
-    margin = max(int(0.002 * fs), 1)
-    search = d[margin: max(len(d) - margin, margin + 1)]
-    if not len(search):
-        return None, None
-    onset = margin + int(np.argmax(search))
-    min_sep = max(int(0.005 * fs), 2)
-    max_sep = max(int(0.060 * fs), min_sep + 2)
-    lo = min(onset + min_sep, len(d) - 1)
-    hi = min(onset + max_sep, len(d))
-    if hi <= lo:
-        return None, None
-    offset = lo + int(np.argmax(d[lo:hi]))
-    return onset + 1, offset + 1
+    x=np.asarray(signal,dtype=float)
+    if len(x)<30 or fs<=0:return None,None
+    # 50-us smoothing at high sampling rates, otherwise one sample.
+    w=max(int(round(0.00005*fs)),1)
+    smooth=np.convolve(x,np.ones(w)/w,mode='same') if w>1 else x
+    d=np.abs(np.diff(smooth))
+    margin=max(int(.002*fs),2)
+    lo0,hi0=margin,len(d)-margin
+    if hi0<=lo0:return None,None
+    n_candidates=min(20,max(4,(hi0-lo0)//10))
+    idx=np.argpartition(d[lo0:hi0],-n_candidates)[-n_candidates:]+lo0
+    idx=sorted(int(i) for i in idx)
+    min_sep=max(int(.005*fs),2); max_sep=max(int(.080*fs),min_sep+1)
+    best=None
+    for i in idx:
+        for j in idx:
+            if j<=i:continue
+            sep=j-i
+            if min_sep<=sep<=max_sep:
+                score=float(d[i]+d[j])
+                # Small preference for earlier valid pairs when scores are similar.
+                score-=1e-6*i
+                if best is None or score>best[0]:best=(score,i,j)
+    if best is None:return None,None
+    return best[1]+1,best[2]+1
 
 
-def _analyze_current_test_pulse(sweep: Sweep, pulse_amplitude_mv: float = 10.0):
-    """Return (Rs MOhm, Rm MOhm, Cm pF) for one Current-1 test-pulse trace.
-
-    AxoGraph's test-pulse convention is approximated as:
-      Rs = dV / I_peak
-      Rtotal = dV / I_steady
-      Rm = Rtotal - Rs
-      Cm = tau / Rm
-
-    where dV is the known command step (default 10 mV), I_peak is the initial
-    current above baseline and I_steady is the late pulse current above
-    baseline. The decay tau is fit from the post-peak current transient.
-    """
-    # In 1-channel test pulse files Neo can classify Current-1 as the Recording
-    # voltage field because it is the only analog signal. Accept either field.
-    raw = sweep.current if sweep.current is not None else sweep.voltage
-    if raw is None or len(raw) < 20:
-        return None
-    x = np.asarray(raw, dtype=float)
-    fs = float(sweep.sampling_rate)
-    onset, offset = _find_test_pulse_window(x, fs)
-    if onset is None or offset is None or offset <= onset + 5:
-        return None
-
-    pre_n = max(int(0.005 * fs), 5)
-    baseline = float(np.median(x[max(0, onset - pre_n):onset]))
-    pulse = x[onset:offset] - baseline
-    if len(pulse) < 10:
-        return None
-
-    # Choose polarity from the largest early deflection and rectify accordingly.
-    early_n = min(max(int(0.002 * fs), 5), len(pulse))
-    sign = 1.0 if abs(np.max(pulse[:early_n])) >= abs(np.min(pulse[:early_n])) else -1.0
-    y = pulse * sign
-    peak_search_n = min(max(int(0.003 * fs), 8), len(y))
-    peak_rel = int(np.argmax(y[:peak_search_n]))
-    i_peak = float(y[peak_rel])
-    tail_n = min(max(int(0.003 * fs), 5), max(len(y) // 4, 5))
-    i_ss = float(np.median(y[-tail_n:]))
-    if i_peak <= 0 or i_ss <= 0 or i_peak <= i_ss:
-        return None
-
-    # Determine whether raw units are pA or A. Normal loader normally converts
-    # current to pA, but the one-channel fallback may leave the current trace in
-    # voltage's slot. Values near 1e-9 strongly indicate amperes.
-    scale_to_pa = 1e12 if max(abs(i_peak), abs(i_ss)) < 1e-3 else 1.0
-    i_peak_pa = i_peak * scale_to_pa
-    i_ss_pa = i_ss * scale_to_pa
-
-    rs = pulse_amplitude_mv / i_peak_pa * 1000.0
-    r_total = pulse_amplitude_mv / i_ss_pa * 1000.0
-    rm = r_total - rs
-    if not (0 < rs < 1000 and 0 < rm < 10000):
-        return None
-
-    # Fit exponential current decay from the peak until shortly before offset.
-    fit_y = y[peak_rel:]
-    # Exclude the final ~0.5 ms to avoid the offset transient.
-    trim = max(int(0.0005 * fs), 1)
-    if len(fit_y) > trim + 5:
-        fit_y = fit_y[:-trim]
-    t_ms = np.arange(len(fit_y)) / fs * 1000.0
-    tau_ms = None
+def _analyze_voltage_clamp_pulse(sweep:Sweep,pulse_amplitude_mv:float):
+    raw=sweep.current if sweep.current is not None else sweep.voltage
+    if raw is None:return None
+    x=np.asarray(raw,dtype=float);fs=float(sweep.sampling_rate)
+    onset,offset=_find_test_pulse_window(x,fs)
+    if onset is None or offset is None or offset-onset<20:return None
+    pre_n=max(int(.005*fs),5)
+    base=float(np.median(x[max(0,onset-pre_n):onset]))
+    pulse=x[onset:offset]-base
+    if len(pulse)<20:return None
+    early=min(max(int(.002*fs),8),len(pulse))
+    sign=1. if abs(np.max(pulse[:early]))>=abs(np.min(pulse[:early])) else -1.
+    y=pulse*sign
+    tail_n=min(max(int(.003*fs),5),max(len(y)//5,5))
+    iss_obs=float(np.median(y[-tail_n:]))
+    if iss_obs<=0:return None
+    t=np.arange(len(y))/fs*1000.
+    # Fit only the pulse, excluding the last 0.25 ms before the OFF transient.
+    trim=max(int(.00025*fs),1); fit_n=max(len(y)-trim,10)
+    tf=t[:fit_n];yf=y[:fit_n]
+    peak=float(np.max(y[:min(len(y),max(int(.0015*fs),10))]))
+    amp=max(peak-iss_obs,1e-9)
+    # Fast term captures pipette capacitance; slow term is membrane charging.
+    p0=[iss_obs,amp*.45,.04,amp*.55,.5]
     try:
-        amp0 = float(fit_y[0] - i_ss)
-        popt, _ = curve_fit(
-            _single_exp, t_ms, fit_y,
-            p0=[i_ss, amp0, 1.0],
-            bounds=([0.0, 0.0, 0.01], [np.inf, np.inf, 100.0]),
-            maxfev=10000,
-        )
-        tau_ms = float(popt[2])
+        popt,_=curve_fit(_double_exp,tf,yf,p0=p0,
+            bounds=([0,0,.002,0,.03],[np.inf,np.inf,.5,np.inf,20.]),maxfev=30000)
+        iss,af,tfst,am,tmem=[float(v) for v in popt]
+        if tfst>tmem: af,tfst,am,tmem=am,tmem,af,tfst
     except Exception:
-        pass
-    if tau_ms is None or not (0.01 < tau_ms < 100.0):
         return None
-    cm = tau_ms * 1000.0 / rm
-    if not (0 < cm < 10000):
-        return None
-    return rs, rm, cm, onset, offset, i_peak_pa, i_ss_pa, tau_ms
+    # Current should already be pA from axgd_io. Retain defensive A->pA scaling.
+    scale=1e12 if max(abs(iss),abs(am),abs(af))<1e-3 else 1.
+    iss_pa=iss*scale; imem0_pa=(iss+am)*scale; raw_peak_pa=peak*scale
+    if iss_pa<=0 or imem0_pa<=iss_pa:return None
+    rs=abs(pulse_amplitude_mv/imem0_pa)*1000.
+    rtot=abs(pulse_amplitude_mv/iss_pa)*1000.
+    rm=rtot-rs
+    if not (1<rs<500 and 5<rm<5000):return None
+    # For a voltage-clamped Rs-(Rm||Cm) circuit, the membrane exponential is
+    # tau = Cm * (Rs || Rm), NOT Cm*Rm.
+    r_parallel=(rs*rm)/(rs+rm)
+    cm=tmem*1000./r_parallel if r_parallel>0 else None
+    if cm is None or not (1<cm<1000):return None
+    return {
+        'Rs (MOhm)':rs,'Rm (MOhm)':rm,'Cm (pF)':cm,
+        'I membrane t0 (pA)':imem0_pa,'I raw peak (pA)':raw_peak_pa,
+        'I steady (pA)':iss_pa,'Tau membrane (ms)':tmem,
+        'Tau fast artifact (ms)':tfst,'Onset (ms)':onset/fs*1000.,
+        'Offset (ms)':offset/fs*1000.,'Mode':'voltage-clamp biexponential'
+    }
 
 
-def compute_test_pulse_properties(recording: Recording,
-                                  pulse_amplitude_mv: float = 10.0,
-                                  ) -> TestPulseProperties:
-    values = []
-    for sweep in recording.sweeps:
-        result = _analyze_current_test_pulse(sweep, pulse_amplitude_mv)
-        if result is not None:
-            rs, rm, cm, onset, offset, i_peak, i_ss, tau = result
-            values.append({
-                "Sweep": sweep.index,
-                "Rs (MOhm)": rs,
-                "Rm (MOhm)": rm,
-                "Cm (pF)": cm,
-                "I peak (pA)": i_peak,
-                "I steady (pA)": i_ss,
-                "Tau (ms)": tau,
-                "Onset (ms)": onset / sweep.sampling_rate * 1000.0,
-                "Offset (ms)": offset / sweep.sampling_rate * 1000.0,
-            })
-    if not values:
-        return TestPulseProperties(pulse_amplitude_mv=pulse_amplitude_mv)
+def compute_test_pulse_properties(recording:Recording,pulse_amplitude_mv:float=10.)->TestPulseProperties:
+    vals=[]
+    for sw in recording.sweeps:
+        r=_analyze_voltage_clamp_pulse(sw,pulse_amplitude_mv)
+        if r is not None:
+            r={'Sweep':sw.index,**r};vals.append(r)
+    if not vals:return TestPulseProperties(pulse_amplitude_mv=pulse_amplitude_mv)
+    # Mean matches the historical spreadsheet convention; QC table exposes
+    # individual sweeps so obvious failed fits can be identified.
     return TestPulseProperties(
-        series_resistance=float(np.mean([v["Rs (MOhm)"] for v in values])),
-        membrane_resistance=float(np.mean([v["Rm (MOhm)"] for v in values])),
-        membrane_capacitance=float(np.mean([v["Cm (pF)"] for v in values])),
-        n_valid_sweeps=len(values),
-        sweep_values=values,
-        pulse_amplitude_mv=pulse_amplitude_mv,
-    )
+        series_resistance=float(np.mean([v['Rs (MOhm)'] for v in vals])),
+        membrane_resistance=float(np.mean([v['Rm (MOhm)'] for v in vals])),
+        membrane_capacitance=float(np.mean([v['Cm (pF)'] for v in vals])),
+        n_valid_sweeps=len(vals),sweep_values=vals,pulse_amplitude_mv=pulse_amplitude_mv)
