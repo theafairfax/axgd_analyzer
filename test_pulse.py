@@ -14,9 +14,15 @@ The ensemble-average current is modeled as
 with a single-exponential fallback when the second component is not warranted.
 Series resistance uses the fitted total current extrapolated to pulse onset,
 membrane resistance uses the steady-state current, and membrane capacitance is
-calculated from the integrated fitted transient with the Rs/Rm divider
-correction. For a single exponential, this reduces exactly to
-Cm = tau / (Rs || Rm).
+computed from the *initial slope* of the fitted transient.  For a double
+exponential this defines an effective early time constant
+
+    tau_eff = (A1 + A2) / (A1/tau1 + A2/tau2)
+
+and Cm = tau_eff / (Rs || Rm).  This preserves the effect of both fitted
+components at pulse onset without allowing a slow dendritic/distributed tail to
+dominate the capacitance estimate through full charge integration.  For a
+single exponential tau_eff is simply tau1.
 """
 from __future__ import annotations
 from dataclasses import dataclass, field
@@ -87,7 +93,6 @@ def _ensemble_average(recording:Recording):
 
 def _fit_transient(t,z):
     """AxoGraph-like double exponential with automatic single-exp fallback."""
-    # Fit single first; this also provides stable initial estimates.
     try:
         ps,_=curve_fit(_single_exp,t,z,p0=[float(z[0]),.5],
                        bounds=([1e-9,.01],[np.inf,20.]),maxfev=30000)
@@ -96,7 +101,6 @@ def _fit_transient(t,z):
     except Exception:
         ps=None; rss_s=np.inf
 
-    # Double exponential. Fast and slow terms are ordered after fitting.
     amp0=max(float(z[0]),1e-9)
     p0=[amp0*.65,.25,amp0*.35,1.5]
     try:
@@ -106,9 +110,6 @@ def _fit_transient(t,z):
         if t1>t2:a1,t1,a2,t2=a2,t2,a1,t1
         pred_d=_double_exp(t,a1,t1,a2,t2)
         rss_d=float(np.sum((z-pred_d)**2))
-        # Require a meaningful second component. AxoGraph automatically reverts
-        # to single exponential when appropriate; BIC plus amplitude separation
-        # gives a conservative approximation of that behavior.
         n=max(len(z),1)
         bic_s=n*np.log(max(rss_s/n,1e-30))+2*np.log(n) if np.isfinite(rss_s) else np.inf
         bic_d=n*np.log(max(rss_d/n,1e-30))+4*np.log(n)
@@ -136,10 +137,6 @@ def _measure_average_trace(x,fs,pulse_amplitude_mv,expected_onset_ms,expected_wi
     sign=1. if abs(np.max(pulse[:early]))>=abs(np.min(pulse[:early])) else -1.
     y=pulse*sign
 
-    # AxoGraph Test Cell first measures steady state at the end of the pulse.
-    # The manual's Test Seal description uses the latter half of the response;
-    # for Test Cell the trace is already flat, so use the final half of the pulse
-    # but exclude a small margin before the OFF edge.
     off_margin=max(int(.001*fs),1)
     ss_start=max(int(len(y)*.5),0)
     ss_end=max(len(y)-off_margin,ss_start+1)
@@ -169,18 +166,26 @@ def _measure_average_trace(x,fs,pulse_amplitude_mv,expected_onset_ms,expected_wi
     rtotal=abs(pulse_amplitude_mv/iss_pa)*1000.
     rm=rtotal-rs
     if not (1<rs<500 and 5<rm<5000):return None
+    rparallel=(rs*rm)/(rs+rm)
+    if rparallel<=0:return None
 
-    # Integral of source transient in pA*ms (= fC).
-    q_fit_fc=a1*t1+a2*t2
-    # Correct source-current transient area for the voltage divider. This
-    # expression reduces to tau/(Rs||Rm) for a single exponential.
-    divider=(rtotal/rm)**2
-    cm=q_fit_fc*divider/abs(pulse_amplitude_mv)
+    # Effective time constant defined by the fitted transient's initial slope:
+    # Itr(0) / -dItr/dt|0.  This is robust to a long slow component that would
+    # otherwise dominate integrated charge and grossly inflate Cm.
+    slope0=a1/max(t1,1e-12)+a2/max(t2,1e-12)
+    tau_effective=transient0_pa/max(slope0,1e-12)
+    cm=tau_effective*1000./rparallel
     if not (1<cm<1000):return None
+
+    # Keep the full integrated transient as a diagnostic only. It reflects slow
+    # distributed charging and is intentionally not used for reported Cm.
+    q_fit_fc=a1*t1+a2*t2
+    divider=(rtotal/rm)**2
+    cm_charge_integral=q_fit_fc*divider/abs(pulse_amplitude_mv)
+    charge_weighted_tau=q_fit_fc/max(transient0_pa,1e-12)
 
     pred=fit['pred']; ss_res=fit['rss']; ss_tot=float(np.sum((z-np.mean(z))**2))
     r2=1.-ss_res/ss_tot if ss_tot>0 else np.nan
-    weighted_tau=q_fit_fc/max(transient0_pa,1e-12)
 
     return {
         'Trace':'20-sweep ensemble average','Model':fit['model'],
@@ -190,7 +195,10 @@ def _measure_average_trace(x,fs,pulse_amplitude_mv,expected_onset_ms,expected_wi
         'A fast (pA)':a1,'Tau fast (ms)':t1,
         'A slow (pA)':a2 if fit['model']=='double' else np.nan,
         'Tau slow (ms)':t2 if fit['model']=='double' else np.nan,
-        'Tau charge-weighted (ms)':weighted_tau,'Transient charge (fC)':q_fit_fc,
+        'Tau effective initial-slope (ms)':tau_effective,
+        'Cm charge-integral diagnostic (pF)':cm_charge_integral,
+        'Tau charge-weighted diagnostic (ms)':charge_weighted_tau,
+        'Transient charge diagnostic (fC)':q_fit_fc,
         'Fit R2':r2,'Skip after onset (ms)':skip_ms,'Fit over (ms)':fit_over_ms,
         'Onset (ms)':onset/fs*1000.,'Offset (ms)':offset/fs*1000.
     }
