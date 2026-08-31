@@ -29,8 +29,7 @@ def _spike_features_at_peak(v,dv,fs,global_idx,next_global_idx,prev_peak_time,ri
         ai=a0+int(np.argmin(v[a0:a1+1]));ahp_v=float(v[ai]);ahp_t=ai/fs
     else:ahp_v=ahp_t=None
     isi=(peak_time-prev_peak_time)*1000. if prev_peak_time is not None else None
-    return SpikeFeatures(peak_time=peak_time,peak_voltage=peak_v,threshold_voltage=threshold_v,threshold_time=threshold_t,
-        amplitude=amplitude,half_width=hw,max_rise_slope=max_rise,max_fall_slope=max_fall,ahp_voltage=ahp_v,ahp_time=ahp_t,isi_prev_ms=isi)
+    return SpikeFeatures(peak_time=peak_time,peak_voltage=peak_v,threshold_voltage=threshold_v,threshold_time=threshold_t,amplitude=amplitude,half_width=hw,max_rise_slope=max_rise,max_fall_slope=max_fall,ahp_voltage=ahp_v,ahp_time=ahp_t,isi_prev_ms=isi)
 
 def detect_spikes(sweep:Sweep,min_peak_mv=-10.,min_prominence_mv=20.,refractory_ms=1.)->List[SpikeFeatures]:
     v=sweep.voltage;fs=sweep.sampling_rate
@@ -40,8 +39,7 @@ def detect_spikes(sweep:Sweep,min_peak_mv=-10.,min_prominence_mv=20.,refractory_
     if not len(peaks):return []
     dv=np.gradient(v)*fs/1000.;out=[];prev=None
     for k,p in enumerate(peaks):
-        gi=start+int(p);nxt=start+int(peaks[k+1]) if k+1<len(peaks) else min(gi+int(.020*fs),end)
-        sp=_spike_features_at_peak(v,dv,fs,gi,nxt,prev,.10);prev=sp.peak_time;out.append(sp)
+        gi=start+int(p);nxt=start+int(peaks[k+1]) if k+1<len(peaks) else min(gi+int(.020*fs),end);sp=_spike_features_at_peak(v,dv,fs,gi,nxt,prev,.10);prev=sp.peak_time;out.append(sp)
     return out
 
 def detect_spikes_template(sweep:Sweep,cfg:TemplateConfig=TemplateConfig(),template_ms=DEFAULT_TEMPLATE_MS,template_mv=DEFAULT_TEMPLATE_MV)->List[SpikeFeatures]:
@@ -52,90 +50,61 @@ def detect_spikes_template(sweep:Sweep,cfg:TemplateConfig=TemplateConfig(),templ
     if not len(peaks):return []
     dv=np.gradient(v)*fs/1000.;out=[];prev=None
     for k,gi0 in enumerate(peaks):
-        gi=int(gi0);nxt=int(peaks[k+1]) if k+1<len(peaks) else min(gi+int(.020*fs),se-1)
-        sp=_spike_features_at_peak(v,dv,fs,gi,nxt,prev,cfg.voltage_threshold_pct)
+        gi=int(gi0);nxt=int(peaks[k+1]) if k+1<len(peaks) else min(gi+int(.020*fs),se-1);sp=_spike_features_at_peak(v,dv,fs,gi,nxt,prev,cfg.voltage_threshold_pct)
         if sp.amplitude>=cfg.amplitude_reject_mv:prev=sp.peak_time;out.append(sp)
     return out
 
-def _crossing_time(v,fs,start,end,target,direction):
-    """Interpolated crossing time in seconds between sample indices start/end."""
+def _cross(v,fs,start,end,target,direction):
     start=max(int(start),0);end=min(int(end),len(v)-1)
-    if end<=start:return None
-    if direction=='up':
-        for i in range(start+1,end+1):
-            if v[i-1] <= target < v[i]:
-                return _interp_cross((i-1)/fs,v[i-1],i/fs,v[i],target)
-    else:
-        for i in range(start+1,end+1):
-            if v[i-1] >= target > v[i]:
-                return _interp_cross((i-1)/fs,v[i-1],i/fs,v[i],target)
+    for i in range(start+1,end+1):
+        if (direction=='up' and v[i-1]<=target<v[i]) or (direction=='down' and v[i-1]>=target>v[i]):return _interp_cross((i-1)/fs,v[i-1],i/fs,v[i],target)
     return None
 
-def _axograph_shape(v,fs,peak_idx,baseline,polarity=1,left_limit=None,right_limit=None):
-    """AxoGraph Find/Measure Peaks and Shapes geometry.
-
-    Settings reproduced from the user's AxoGraph dialog:
-      onset at 5% of peak
-      rise from 10% to 90% of peak
-      width at 50% of peak
-      decay from 100% to 50% of peak
-
-    `polarity` is +1 for APs and -1 for negative-going AHPs. Times are
-    interpolated between samples. Location and onset are expressed relative to
-    the event's 5%-onset time, matching AxoGraph's event-coordinate convention.
-    """
-    peak_idx=int(peak_idx);left=max(0,peak_idx-int(.010*fs)) if left_limit is None else max(0,int(left_limit));right=min(len(v)-1,peak_idx+int(.020*fs)) if right_limit is None else min(len(v)-1,int(right_limit))
-    peak=float(v[peak_idx]);amp=polarity*(peak-float(baseline))
+def _shape(v,fs,peak_idx,baseline,polarity,left,right,time_origin_idx):
+    peak=float(v[peak_idx]);amp=polarity*(peak-baseline)
     if amp<=0:return None
-    def level(frac):return float(baseline)+polarity*amp*frac
-    rise_dir='up' if polarity>0 else 'down';fall_dir='down' if polarity>0 else 'up'
-    onset_t=_crossing_time(v,fs,left,peak_idx,level(.05),rise_dir)
-    rise10_t=_crossing_time(v,fs,left,peak_idx,level(.10),rise_dir)
-    rise90_t=_crossing_time(v,fs,left,peak_idx,level(.90),rise_dir)
-    half_rise_t=_crossing_time(v,fs,left,peak_idx,level(.50),rise_dir)
-    half_decay_t=_crossing_time(v,fs,peak_idx,right,level(.50),fall_dir)
-    peak_t=peak_idx/fs
-    if onset_t is None:onset_t=rise10_t if rise10_t is not None else peak_t
-    location=(peak_t-onset_t)*1000.
-    # AxoGraph reports onset relative to the detected event/peak-position origin;
-    # for the embedded template this origin precedes the waveform peak. Preserve
-    # that signed event coordinate by expressing onset relative to peak position.
-    onset=(onset_t-peak_t)*1000.
-    rise=((rise90_t-rise10_t)*1000.) if rise10_t is not None and rise90_t is not None else np.nan
-    width=((half_decay_t-half_rise_t)*1000.) if half_rise_t is not None and half_decay_t is not None else np.nan
-    decay=((half_decay_t-peak_t)*1000.) if half_decay_t is not None else np.nan
-    return SpikeEventFeatures(peak_voltage=polarity*amp,location_ms=location,onset_ms=onset,rise_ms=rise,width_ms=width,decay_ms=decay)
+    level=lambda f:baseline+polarity*amp*f;up='up' if polarity>0 else 'down';down='down' if polarity>0 else 'up'
+    t05=_cross(v,fs,left,peak_idx,level(.05),up);t10=_cross(v,fs,left,peak_idx,level(.10),up);t90=_cross(v,fs,left,peak_idx,level(.90),up);t50a=_cross(v,fs,left,peak_idx,level(.50),up);t50b=_cross(v,fs,peak_idx,right,level(.50),down);pt=peak_idx/fs;origin=time_origin_idx/fs
+    return SpikeEventFeatures(peak_voltage=amp,location_ms=(pt-origin)*1000.,onset_ms=((t05-origin)*1000. if t05 is not None else np.nan),rise_ms=((t90-t10)*1000. if t10 is not None and t90 is not None else np.nan),width_ms=((t50b-t50a)*1000. if t50a is not None and t50b is not None else np.nan),decay_ms=((t50b-pt)*1000. if t50b is not None else np.nan))
+
+def build_average_rheobase_event_features(v,fs,spikes,pre_ms=10.,post_ms=40.):
+    """Measure AxoGraph-style SPIKE/AHP shapes on the averaged captured AP.
+
+    The supplied AxoGraph captured-event file established the important data
+    geometry: its x-axis is -10 to +40 ms at 12.5 us/sample and its Episode #
+    metadata identifies sweep 4, the first spiking sweep. We therefore capture
+    that same 50-ms window around every template-detected AP in the rheobase
+    sweep, align captures on the AP peak, and average *waveforms before shape
+    measurement*. This mirrors AxoGraph's captured-event workflow more closely
+    than averaging nonlinear measurements from separate APs.
+    """
+    if not spikes:return None,None
+    pre=max(int(round(pre_ms/1000.*fs)),1);post=max(int(round(post_ms/1000.*fs)),1);captures=[]
+    for sp in spikes:
+        p=int(round(sp.peak_time*fs));lo=p-pre;hi=p+post+1
+        if lo>=0 and hi<=len(v):captures.append(np.asarray(v[lo:hi],dtype=float))
+    if not captures:return None,None
+    mean=np.mean(np.vstack(captures),axis=0);origin=pre;peak_search=max(int(.002*fs),1);peak=origin+int(np.argmax(mean[origin-peak_search:origin+peak_search+1]))-peak_search
+    # AxoGraph's template waveform has a zero pre-event baseline. Baseline the
+    # averaged capture from a quiet pre-spike region, avoiding the rising phase.
+    b0=max(0,origin-int(.008*fs));b1=max(b0+1,origin-int(.002*fs));base=float(np.mean(mean[b0:b1]));spike=_shape(mean,fs,peak,base,1,max(0,origin-int(.004*fs)),min(len(mean)-1,peak+int(.006*fs)),origin)
+    # Find the post-AP trough on the same averaged waveform. Treat AHP as a
+    # negative event relative to the late captured-waveform baseline, exactly
+    # analogous to AxoGraph Find/Measure Peaks and Shapes with inverted polarity.
+    a0=min(peak+max(int(.00025*fs),1),len(mean)-1);a1=min(origin+int(.020*fs),len(mean)-1)
+    ahp=None
+    if a1>a0:
+        trough=a0+int(np.argmin(mean[a0:a1+1]));late0=min(origin+int(.025*fs),len(mean)-2);late1=min(origin+int(.038*fs),len(mean)-1);ahp_base=float(np.mean(mean[late0:late1])) if late1>late0 else base
+        ahp=_shape(mean,fs,trough,ahp_base,-1,peak,min(len(mean)-1,origin+int(.040*fs)),origin)
+    return spike,ahp
 
 def build_spike_event_features(v,fs,spike,step_onset_idx):
-    """AxoGraph-compatible positive SPIKE event shape measurements."""
-    pi=int(round(spike.peak_time*fs))
-    # For Find/Measure Peaks and Shapes, peak amplitude is referenced to the
-    # local pre-event baseline rather than the physiological dV/dt threshold.
-    left=max(int(step_onset_idx),pi-max(int(.005*fs),5))
-    baseline=float(np.median(v[left:max(left+1,pi-int(.001*fs))])) if pi-left>2 else float(spike.threshold_voltage)
-    return _axograph_shape(v,fs,pi,baseline,polarity=1,left_limit=left,right_limit=min(len(v)-1,pi+int(.010*fs)))
-
+    pi=int(round(spike.peak_time*fs));left=max(int(step_onset_idx),pi-max(int(.005*fs),5));baseline=float(np.median(v[left:max(left+1,pi-int(.001*fs))])) if pi-left>2 else float(spike.threshold_voltage);return _shape(v,fs,pi,baseline,1,left,min(len(v)-1,pi+int(.010*fs)),pi)
 def build_ahp_event_features(v,fs,spike,step_onset_idx,baseline_v=None):
-    """AxoGraph-compatible negative-going AHP event shape measurements."""
     if spike.ahp_voltage is None or spike.ahp_time is None:return None
-    pi=int(round(spike.peak_time*fs));tr=int(round(spike.ahp_time*fs))
-    # AHP baseline is the local voltage immediately after the AP has repolarized,
-    # bounded by the AP peak and AHP trough. This mirrors Find/Measure Shapes on
-    # an inverted (negative-going) event rather than using AP threshold as base.
-    pre0=min(pi+max(int(.00025*fs),1),tr)
-    pre1=max(pre0+1,tr-max(int(.00025*fs),1))
-    if pre1>pre0:
-        base=float(np.max(v[pre0:pre1+1]))
-    else:
-        base=float(spike.threshold_voltage if baseline_v is None else baseline_v)
-    return _axograph_shape(v,fs,tr,base,polarity=-1,left_limit=pi,right_limit=min(len(v)-1,tr+int(.020*fs)))
-
-def first_singlet_or_doublet(spikes,burst_window_ms=20.):
-    if not spikes:return []
-    return spikes[:2] if len(spikes)>=2 and spikes[1].isi_prev_ms is not None and spikes[1].isi_prev_ms<=burst_window_ms else spikes[:1]
-
+    pi=int(round(spike.peak_time*fs));tr=int(round(spike.ahp_time*fs));base=float(spike.threshold_voltage if baseline_v is None else baseline_v);return _shape(v,fs,tr,base,-1,pi,min(len(v)-1,tr+int(.020*fs)),pi)
+def first_singlet_or_doublet(spikes,burst_window_ms=20.):return spikes[:2] if len(spikes)>=2 and spikes[1].isi_prev_ms is not None and spikes[1].isi_prev_ms<=burst_window_ms else spikes[:1]
 def adaptation_index(spikes):
     isis=[s.isi_prev_ms for s in spikes if s.isi_prev_ms is not None]
     if len(isis)<2:return None
-    vals=[(isis[i+1]-isis[i])/(isis[i+1]+isis[i]) for i in range(len(isis)-1) if isis[i+1]+isis[i]!=0]
-    return float(np.mean(vals)) if vals else None
+    vals=[(isis[i+1]-isis[i])/(isis[i+1]+isis[i]) for i in range(len(isis)-1) if isis[i+1]+isis[i]!=0];return float(np.mean(vals)) if vals else None
