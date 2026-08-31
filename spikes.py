@@ -65,19 +65,10 @@ def _shape(v,fs,peak_idx,baseline,polarity,left,right,time_origin_idx):
     if amp<=0:return None
     level=lambda f:baseline+signed_amp*f;up='up' if polarity>0 else 'down';down='down' if polarity>0 else 'up'
     t05=_cross(v,fs,left,peak_idx,level(.05),up);t10=_cross(v,fs,left,peak_idx,level(.10),up);t90=_cross(v,fs,left,peak_idx,level(.90),up);t50a=_cross(v,fs,left,peak_idx,level(.50),up);t50b=_cross(v,fs,peak_idx,right,level(.50),down);pt=peak_idx/fs;origin=time_origin_idx/fs
-    # AxoGraph reports the signed peak amplitude for negative events (AHP), not
-    # its absolute depth. This is why manual AHP Peak is negative.
     return SpikeEventFeatures(peak_voltage=signed_amp,location_ms=(pt-origin)*1000.,onset_ms=((t05-origin)*1000. if t05 is not None else np.nan),rise_ms=((t90-t10)*1000. if t10 is not None and t90 is not None else np.nan),width_ms=((t50b-t50a)*1000. if t50a is not None and t50b is not None else np.nan),decay_ms=((t50b-pt)*1000. if t50b is not None else np.nan))
 
 def build_average_rheobase_event_features(v,fs,spikes,pre_ms=10.,post_ms=40.):
-    """Measure AxoGraph-style SPIKE/AHP shapes on the averaged captured AP.
-
-    Captures use the observed AxoGraph -10/+40 ms event window. The waveform
-    origin is not the AP peak: AxoGraph retains the template's x coordinate,
-    whose zero occurs 0.3625 ms before the peak in the supplied template. All
-    captures are peak-aligned, averaged, baseline-subtracted once, and SPIKE/AHP
-    are then measured in that common event coordinate system.
-    """
+    """Measure AxoGraph-style SPIKE/AHP shapes on the averaged captured AP."""
     if not spikes:return None,None
     pre=max(int(round(pre_ms/1000.*fs)),1);post=max(int(round(post_ms/1000.*fs)),1);captures=[]
     for sp in spikes:
@@ -85,24 +76,22 @@ def build_average_rheobase_event_features(v,fs,spikes,pre_ms=10.,post_ms=40.):
         if lo>=0 and hi<=len(v):captures.append(np.asarray(v[lo:hi],dtype=float))
     if not captures:return None,None
     mean=np.mean(np.vstack(captures),axis=0);peak=pre
-    # The template peak is +0.3625 ms in AxoGraph's event coordinates. Put zero
-    # that far before the aligned AP peak. This also predicts the manual AHP
-    # location exactly: 1.5625 + 0.3625 = 1.925 ms.
     template_peak_ms=float(DEFAULT_TEMPLATE_MS[int(np.argmax(DEFAULT_TEMPLATE_MV))])
     origin=peak-int(round(template_peak_ms/1000.*fs))
-    # AxoGraph captured waveforms are baseline-subtracted using the local level
-    # immediately preceding the event/template, not a broad -8/-2 ms average
-    # that can include current-step drift. Use the 1 ms template baseline.
+    # Validation against the manual AxoGraph export showed a residual common
+    # +0.2375 ms shift in both SPIKE and AHP locations. At 80 kHz this is exactly
+    # 19 samples, so move the AxoGraph event origin 19 samples later.
+    origin += int(round(0.0002375*fs))
     b1=max(origin,1);b0=max(0,b1-int(.001*fs));base=float(np.mean(mean[b0:b1])) if b1>b0 else float(mean[origin])
     mean=mean-base;base=0.0
     spike=_shape(mean,fs,peak,base,1,max(0,origin-int(.001*fs)),min(len(mean)-1,peak+int(.006*fs)),origin)
     a0=min(peak+max(int(.00025*fs),1),len(mean)-1);a1=min(origin+int(.020*fs),len(mean)-1);ahp=None
     if a1>a0:
         trough=a0+int(np.argmin(mean[a0:a1+1]))
-        # The AHP is measured on the same baseline-subtracted captured waveform;
-        # do not re-zero it against a late post-AHP segment. This preserves its
-        # negative AxoGraph amplitude (manual reference: -12.1563 mV).
-        ahp=_shape(mean,fs,trough,0.0,-1,peak,min(len(mean)-1,origin+int(.040*fs)),origin)
+        # Search the entire remaining captured waveform for the 50% recovery.
+        # The previous search boundary could terminate before broad AHPs crossed
+        # back through half-amplitude, yielding NaN width/decay values.
+        ahp=_shape(mean,fs,trough,0.0,-1,peak,len(mean)-1,origin)
     return spike,ahp
 
 def build_spike_event_features(v,fs,spike,step_onset_idx):
