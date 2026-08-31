@@ -5,7 +5,7 @@ import numpy as np
 from scipy.optimize import curve_fit
 from models import Recording,Sweep,SweepAnalysis,IntrinsicProperties,SpikeEventFeatures
 from protocol import detect_steps
-from spikes import adaptation_index as _adaptation_index,detect_spikes_template,build_spike_event_features,build_ahp_event_features
+from spikes import adaptation_index as _adaptation_index,detect_spikes_template,build_spike_event_features,build_ahp_event_features,build_average_rheobase_event_features
 from template_matching import TemplateConfig
 
 def _exp_decay(t,v_inf,delta,tau):return v_inf+delta*np.exp(-t/tau)
@@ -19,10 +19,6 @@ def _fit_tau(s):
     except:return None
 
 def _analyze_sweep(s,template_cfg):
-    # Use the same AxoGraph-style template detector as Captured APs so F-I,
-    # rheobase, and AP Dynamics all count the same events. The former generic
-    # find_peaks path required peaks to exceed -10 mV and could therefore miss
-    # adapted APs later in high-current trains.
     spikes=detect_spikes_template(s,template_cfg);dur=s.step_duration or len(s.voltage)/s.sampling_rate;steady=defl=peak=sag=None
     if s.step_onset_idx is not None and s.step_offset_idx is not None and not spikes:
         o,e=s.step_onset_idx,s.step_offset_idx;tail=max(e-int(.1*(e-o)),o);steady=float(np.mean(s.voltage[tail:e]));defl=steady-(s.baseline_voltage or 0.)
@@ -55,22 +51,21 @@ def compute_properties(recording:Recording,template_cfg:TemplateConfig=TemplateC
         last=recording.sweeps[-1]
         if last.step_offset_idx is not None:
             tail=last.voltage[min(last.step_offset_idx+int(.05*last.sampling_rate),len(last.voltage)):];post=float(np.median(tail)) if len(tail) else last.baseline_voltage
-    # The first N sweeps are pooled only for the aggregate Captured APs metric.
-    # Per-sweep analyses above use the same detector across every sweep.
     captured=sum(a.n_spikes for a in aa[:template_cfg.n_episodes])
     sev=aev=None;burst=nburst=None
     if rb:
         rs=next((s for s in recording.sweeps if s.index==rb.sweep_index),None)
         if rs is not None:
-            # ONLY APs in the first (lowest-current) spiking sweep contribute to intrinsic AP/AHP summaries.
-            shape=rb.spikes;o=rs.step_onset_idx or 0
-            sev=_mean_event([build_spike_event_features(rs.voltage,rs.sampling_rate,x,o) for x in shape])
-            aev=_mean_event([build_ahp_event_features(rs.voltage,rs.sampling_rate,x,o,rs.baseline_voltage) for x in shape])
-            burst=any(x.isi_prev_ms is not None and x.isi_prev_ms<=template_cfg.burst_window_ms for x in shape[1:]);nburst=(1+sum(x.isi_prev_ms is not None and x.isi_prev_ms<=template_cfg.burst_window_ms for x in shape[1:])) if shape else 0
+            # AxoGraph's captured-event workflow operates on the waveform made
+            # from the detected rheobase events. Reproduce that order: capture
+            # each detected AP, align on its peak, average the voltage traces,
+            # then measure SPIKE and AHP shapes on that single mean waveform.
+            # This is intentionally different from averaging per-AP shape
+            # measurements, which is nonlinear for rise/width/decay crossings.
+            sev,aev=build_average_rheobase_event_features(rs.voltage,rs.sampling_rate,rb.spikes)
+            burst=any(x.isi_prev_ms is not None and x.isi_prev_ms<=template_cfg.burst_window_ms for x in rb.spikes[1:]);nburst=(1+sum(x.isi_prev_ms is not None and x.isi_prev_ms<=template_cfg.burst_window_ms for x in rb.spikes[1:])) if rb.spikes else 0
     return IntrinsicProperties(resting_membrane_potential=rmp,input_resistance=rin,membrane_tau=tau,membrane_capacitance=(tau*1000/rin if tau is not None and rin else None),sag_ratio=sag,rheobase=rheo,first_spike_threshold=thr,first_spike_amplitude=amp,first_spike_half_width=hw,max_firing_rate_hz=maxfr,fi_slope=slope,adaptation_index=rb.adaptation_index if rb and rb.n_spikes>=3 else None,fi_curve=fi,sweep_analyses=aa,series_resistance=None,membrane_resistance=rin,rmp_pre=pre,rmp_post=post,captured_aps=captured,spike_event=sev,ahp_event=aev,has_burst_at_rheobase=burst,n_burst_events_at_rheobase=nburst)
-def compute_phase_plane(time_ms,voltage_mv):
-    # mV/ms is numerically identical to V/s. Previous implementation divided by seconds and was 1000x too large.
-    return voltage_mv,np.gradient(voltage_mv)/np.gradient(time_ms)
+def compute_phase_plane(time_ms,voltage_mv):return voltage_mv,np.gradient(voltage_mv)/np.gradient(time_ms)
 def analyze_fahp(time_ms,voltage_mv,spike_peak_idx,v_rest,next_spike_idx=None,max_fahp_window_ms=20.):
     dt=time_ms[1]-time_ms[0];end=min(spike_peak_idx+int(max_fahp_window_ms/dt),next_spike_idx if next_spike_idx is not None else len(voltage_mv),len(voltage_mv));post=voltage_mv[spike_peak_idx:end]
     if not len(post):return None
