@@ -1,10 +1,10 @@
-"""Action-potential detection and waveform feature extraction."""
+"""Action-potential detection and AxoGraph-style waveform feature extraction."""
 from __future__ import annotations
 from typing import List,Optional
 import numpy as np
 from scipy.signal import find_peaks
 from models import Sweep,SpikeFeatures,SpikeEventFeatures
-from template_matching import DEFAULT_TEMPLATE_MS,DEFAULT_TEMPLATE_MV,TemplateConfig,detect_events_by_template
+from template_matching import DEFAULT_TEMPLATE_MS,DEFAULT_TEMPLATE_MV,TemplateConfig,detect_events_by_template,detect_template_events
 
 def _interp_cross(x0,y0,x1,y1,target):
     if y1==y0:return float(x0)
@@ -61,80 +61,94 @@ def _cross(v,fs,start,end,target,direction):
     return None
 
 def _shape(v,fs,peak_idx,baseline,polarity,left,right,time_origin_idx):
+    """AxoGraph Detect Events shape rules: 20-80% rise and 50% width."""
     peak=float(v[peak_idx]);signed_amp=peak-baseline;amp=polarity*signed_amp
     if amp<=0:return None
     level=lambda f:baseline+signed_amp*f;up='up' if polarity>0 else 'down';down='down' if polarity>0 else 'up'
-    t05=_cross(v,fs,left,peak_idx,level(.05),up);t10=_cross(v,fs,left,peak_idx,level(.10),up);t90=_cross(v,fs,left,peak_idx,level(.90),up);t50a=_cross(v,fs,left,peak_idx,level(.50),up);t50b=_cross(v,fs,peak_idx,right,level(.50),down);pt=peak_idx/fs;origin=time_origin_idx/fs
-    return SpikeEventFeatures(peak_voltage=signed_amp,location_ms=(pt-origin)*1000.,onset_ms=((t05-origin)*1000. if t05 is not None else np.nan),rise_ms=((t90-t10)*1000. if t10 is not None and t90 is not None else np.nan),width_ms=((t50b-t50a)*1000. if t50a is not None and t50b is not None else np.nan),decay_ms=((t50b-pt)*1000. if t50b is not None else np.nan))
+    t05=_cross(v,fs,left,peak_idx,level(.05),up)
+    t20=_cross(v,fs,left,peak_idx,level(.20),up);t80=_cross(v,fs,left,peak_idx,level(.80),up)
+    t50a=_cross(v,fs,left,peak_idx,level(.50),up);t50b=_cross(v,fs,peak_idx,right,level(.50),down);pt=peak_idx/fs;origin=time_origin_idx/fs
+    return SpikeEventFeatures(peak_voltage=signed_amp,location_ms=(pt-origin)*1000.,onset_ms=((t05-origin)*1000. if t05 is not None else np.nan),rise_ms=((t80-t20)*1000. if t20 is not None and t80 is not None else np.nan),width_ms=((t50b-t50a)*1000. if t50a is not None and t50b is not None else np.nan),decay_ms=((t50b-pt)*1000. if t50b is not None else np.nan))
 
 def _first_recovering_trough(v,fs,start,end,min_prominence_mv=.10):
-    """Find the first physiologic post-spike trough rather than a window edge.
-
-    A valid AHP trough must be a local minimum with subsequent recovery. This
-    prevents a slowly drifting trace from making the end of a 20 ms search
-    window look like the AHP minimum.
-    """
     start=max(int(start),1);end=min(int(end),len(v)-2)
     if end<=start:return None
-    w=np.asarray(v[start:end+1],dtype=float)
-    distance=max(int(round(.00015*fs)),1)
+    w=np.asarray(v[start:end+1],dtype=float);distance=max(int(round(.00015*fs)),1)
     minima,_=find_peaks(-w,prominence=max(float(min_prominence_mv),0.),distance=distance)
     for rel in minima:
-        idx=start+int(rel)
-        recover_end=min(idx+max(int(round(.003*fs)),2),len(v)-1)
-        if recover_end>idx and np.max(v[idx+1:recover_end+1])>v[idx]+min_prominence_mv:
-            return idx
-    # Conservative derivative fallback: first negative-to-positive slope turn.
+        idx=start+int(rel);recover_end=min(idx+max(int(round(.003*fs)),2),len(v)-1)
+        if recover_end>idx and np.max(v[idx+1:recover_end+1])>v[idx]+min_prominence_mv:return idx
     d=np.gradient(v)
     for idx in range(start+1,end):
         if d[idx-1]<0<=d[idx]:
             recover_end=min(idx+max(int(round(.002*fs)),2),len(v)-1)
-            if recover_end>idx and np.max(v[idx+1:recover_end+1])>v[idx]+min_prominence_mv:
-                return idx
+            if recover_end>idx and np.max(v[idx+1:recover_end+1])>v[idx]+min_prominence_mv:return idx
     return None
 
 def build_average_rheobase_event_features(v,fs,spikes,pre_ms=10.,post_ms=40.,template_cfg:TemplateConfig=TemplateConfig()):
-    """Measure AxoGraph-style SPIKE/AHP shapes in template-event coordinates.
+    """Average captures using AxoGraph's actual template-event coordinates.
 
-    Do not peak-center captures. AxoGraph's Events workflow is template aligned;
-    peak-centering every capture erases real event timing and forces SPIKE
-    location toward a constant. Reconstruct each event's template origin from
-    the detected peak and the template peak offset, capture in that coordinate
-    system, then average.
+    AxoGraph source (Detect Events.axtx):
+      captureOffset = captureBaselinePoints - templateBaselinePoints - 1
+      firstCapturePoint = eventLatency - captureOffset
+    and Detect Events Utilities.axtx creates capture x-data beginning at
+      (1 - captureBaselinePoints) * dx.
+
+    The detector is rerun here so the criterion-peak latency is retained.  The
+    public spike list intentionally remains raw-peak based for other metrics.
     """
-    if not spikes:return None,None
-    pre=max(int(round(pre_ms/1000.*fs)),1);post=max(int(round(post_ms/1000.*fs)),1)
-    template_peak_idx=int(np.argmax(DEFAULT_TEMPLATE_MV))
-    template_peak_from_start_ms=float(DEFAULT_TEMPLATE_MS[template_peak_idx]-DEFAULT_TEMPLATE_MS[0])
-    peak_offset=max(int(round(template_peak_from_start_ms/1000.*fs)),0)
+    if not spikes or fs<=0:return None,None
+    # Restrict the rerun to the neighborhood containing the supplied rheobase
+    # spikes; this keeps the same lab detection settings without peak-centering.
+    first_peak=min(int(round(s.peak_time*fs)) for s in spikes)
+    last_peak=max(int(round(s.peak_time*fs)) for s in spikes)
+    margin=max(int(round(.010*fs)),1)
+    events=detect_template_events(v,fs,DEFAULT_TEMPLATE_MS,DEFAULT_TEMPLATE_MV,template_cfg,
+                                  max(0,first_peak-margin),min(len(v),last_peak+margin))
+    if not events:return None,None
+    spike_peaks=np.asarray([int(round(s.peak_time*fs)) for s in spikes],dtype=int)
+    # Keep only detector events corresponding to the supplied rheobase spikes.
+    matched=[];tol=max(int(round(.001*fs)),1)
+    for e in events:
+        if len(spike_peaks) and int(np.min(np.abs(spike_peaks-e.peak_index)))<=tol:matched.append(e)
+    if not matched:return None,None
+
+    template_baseline=max(int(round(template_cfg.baseline_ms/1000.*fs)),1)
+    capture_baseline=max(int(round(template_cfg.capture_baseline_ms/1000.*fs)),template_baseline+1)
+    capture_after=max(int(round(template_cfg.capture_ms/1000.*fs)),1)
+    capture_total=capture_baseline+capture_after
+    capture_offset=capture_baseline-template_baseline-1
     captures=[]
-    for sp in spikes:
-        p=int(round(sp.peak_time*fs))
-        event_start=p-peak_offset
-        lo=event_start-pre;hi=event_start+post+1
-        if lo>=0 and hi<=len(v):captures.append(np.asarray(v[lo:hi],dtype=float))
+    for e in matched:
+        first=e.detection_index-capture_offset
+        last=first+capture_total
+        if first>=0 and last<=len(v):captures.append(np.asarray(v[first:last],dtype=float))
     if not captures:return None,None
-    mean=np.mean(np.vstack(captures),axis=0);origin=pre
-    # Baseline is the 1 ms immediately preceding the template event origin.
-    b1=max(origin,1);b0=max(0,b1-int(round(template_cfg.baseline_ms/1000.*fs)))
+    mean=np.mean(np.vstack(captures),axis=0)
+    # AxoGraph's capture x-axis makes sample captureBaselinePoints-1 exactly t=0.
+    origin=capture_baseline-1
+    # baselineCaptured uses the capture region immediately preceding the
+    # template baseline for copied-from-graph templates.  Use the quiet 1 ms
+    # immediately before t=0 for this lab template, matching its defined flat baseline.
+    b1=max(origin,1);b0=max(0,b1-template_baseline)
     base=float(np.mean(mean[b0:b1])) if b1>b0 else float(mean[origin])
     mean=mean-base;base=0.0
-    # Find the AP maximum from the event-aligned mean rather than assuming it is
-    # at a fixed capture index.
-    spike_left=max(0,origin-int(.001*fs));spike_right=min(len(mean)-1,origin+max(int(.008*fs),peak_offset+int(.003*fs)))
-    if spike_right<=spike_left:return None,None
+
+    # Search the complete post-zero event region.  Absolute location now comes
+    # from AxoGraph's capture coordinate rather than a template-peak guess.
+    spike_left=max(0,origin-template_baseline)
+    spike_right=min(len(mean)-1,origin+max(int(.008*fs),1))
     peak=spike_left+int(np.argmax(mean[spike_left:spike_right+1]))
     spike=_shape(mean,fs,peak,base,1,spike_left,min(len(mean)-1,peak+int(.006*fs)),origin)
-    # Restrict AHP selection to before the next AP when a burst is present.
+
     next_peak=None
     later,_=find_peaks(mean[peak+max(int(.001*fs),1):],prominence=10.,distance=max(int(.001*fs),1))
     if len(later):next_peak=peak+max(int(.001*fs),1)+int(later[0])
     a0=min(peak+max(int(.00025*fs),1),len(mean)-1)
-    a1=min(origin+int(.020*fs),len(mean)-2)
+    a1=min(len(mean)-2,origin+int(.008*fs))
     if next_peak is not None:a1=min(a1,next_peak-1)
-    ahp=None
     trough=_first_recovering_trough(mean,fs,a0,a1)
-    if trough is not None:ahp=_shape(mean,fs,trough,0.0,-1,peak,min(len(mean)-1,trough+int(.020*fs)),origin)
+    ahp=_shape(mean,fs,trough,0.0,-1,peak,min(len(mean)-1,trough+int(.008*fs)),origin) if trough is not None else None
     return spike,ahp
 
 def build_spike_event_features(v,fs,spike,step_onset_idx):
