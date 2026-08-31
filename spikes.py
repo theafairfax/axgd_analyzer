@@ -61,7 +61,7 @@ def _cross(v,fs,start,end,target,direction):
     return None
 
 def _shape(v,fs,peak_idx,baseline,polarity,left,right,time_origin_idx):
-    """AxoGraph Detect Events shape rules: 20-80% rise and 50% width."""
+    """Measure event amplitude/location/onset/rise/width on an averaged capture."""
     peak=float(v[peak_idx]);signed_amp=peak-baseline;amp=polarity*signed_amp
     if amp<=0:return None
     level=lambda f:baseline+signed_amp*f;up='up' if polarity>0 else 'down';down='down' if polarity>0 else 'up'
@@ -85,21 +85,49 @@ def _first_recovering_trough(v,fs,start,end,min_prominence_mv=.10):
             if recover_end>idx and np.max(v[idx+1:recover_end+1])>v[idx]+min_prominence_mv:return idx
     return None
 
-def build_average_rheobase_event_features(v,fs,spikes,pre_ms=10.,post_ms=40.,template_cfg:TemplateConfig=TemplateConfig()):
-    """Average captures using AxoGraph's actual template-event coordinates.
+def _align_captures_at_onset(captures,fs,origin_idx,template_baseline_points,onset_sd_multiple=8.0):
+    """Mirror AxoGraph's separate Align at Onset step before averaging.
 
-    AxoGraph source (Detect Events.axtx):
-      captureOffset = captureBaselinePoints - templateBaselinePoints - 1
-      firstCapturePoint = eventLatency - captureOffset
-    and Detect Events Utilities.axtx creates capture x-data beginning at
-      (1 - captureBaselinePoints) * dx.
-
-    The detector is rerun here so the criterion-peak latency is retained.  The
-    public spike list intentionally remains raw-peak based for other metrics.
+    Align at Onset.axtx derives one common baseline mean/SD from the capture
+    baseline, scans forward until |event-baseline| exceeds baselineSD*8, and
+    shifts each captured episode so those onsets coincide.  We use the median
+    detected onset as the target so alignment does not impose a new arbitrary
+    absolute coordinate on the capture x-axis.
     """
+    if not captures:return [],origin_idx
+    arrs=[np.asarray(c,dtype=float) for c in captures]
+    b1=max(int(origin_idx),1);b0=max(0,b1-max(int(template_baseline_points),2))
+    baseline_samples=np.concatenate([a[b0:b1] for a in arrs if len(a)>=b1]) if b1>b0 else np.array([])
+    if baseline_samples.size<4:return arrs,origin_idx
+    base=float(np.mean(baseline_samples));sd=float(np.std(baseline_samples,ddof=1))
+    threshold=max(onset_sd_multiple*sd,0.25)
+    onsets=[]
+    search_start=max(b0,0);search_end=min(len(arrs[0])-1,origin_idx+max(int(round(.004*fs)),2))
+    for a in arrs:
+        oi=None
+        for i in range(search_start,search_end+1):
+            if abs(a[i]-base)>=threshold:
+                oi=i;break
+        onsets.append(oi)
+    valid=[o for o in onsets if o is not None]
+    if not valid:return arrs,origin_idx
+    target=int(round(float(np.median(valid))))
+    aligned=[]
+    for a,o in zip(arrs,onsets):
+        if o is None:continue
+        shift=target-o
+        out=np.full_like(a,np.nan,dtype=float)
+        if shift>=0:
+            if shift<len(a):out[shift:]=a[:len(a)-shift]
+        else:
+            k=-shift
+            if k<len(a):out[:len(a)-k]=a[k:]
+        aligned.append(out)
+    return aligned,origin_idx
+
+def build_average_rheobase_event_features(v,fs,spikes,pre_ms=10.,post_ms=40.,template_cfg:TemplateConfig=TemplateConfig()):
+    """Detect, capture, onset-align, average, then measure rheobase AP events."""
     if not spikes or fs<=0:return None,None
-    # Restrict the rerun to the neighborhood containing the supplied rheobase
-    # spikes; this keeps the same lab detection settings without peak-centering.
     first_peak=min(int(round(s.peak_time*fs)) for s in spikes)
     last_peak=max(int(round(s.peak_time*fs)) for s in spikes)
     margin=max(int(round(.010*fs)),1)
@@ -107,7 +135,6 @@ def build_average_rheobase_event_features(v,fs,spikes,pre_ms=10.,post_ms=40.,tem
                                   max(0,first_peak-margin),min(len(v),last_peak+margin))
     if not events:return None,None
     spike_peaks=np.asarray([int(round(s.peak_time*fs)) for s in spikes],dtype=int)
-    # Keep only detector events corresponding to the supplied rheobase spikes.
     matched=[];tol=max(int(round(.001*fs)),1)
     for e in events:
         if len(spike_peaks) and int(np.min(np.abs(spike_peaks-e.peak_index)))<=tol:matched.append(e)
@@ -124,18 +151,25 @@ def build_average_rheobase_event_features(v,fs,spikes,pre_ms=10.,post_ms=40.,tem
         last=first+capture_total
         if first>=0 and last<=len(v):captures.append(np.asarray(v[first:last],dtype=float))
     if not captures:return None,None
-    mean=np.mean(np.vstack(captures),axis=0)
-    # AxoGraph's capture x-axis makes sample captureBaselinePoints-1 exactly t=0.
+
     origin=capture_baseline-1
-    # baselineCaptured uses the capture region immediately preceding the
-    # template baseline for copied-from-graph templates.  Use the quiet 1 ms
-    # immediately before t=0 for this lab template, matching its defined flat baseline.
+    aligned,origin=_align_captures_at_onset(captures,fs,origin,template_baseline)
+    if not aligned:return None,None
+    stack=np.vstack(aligned)
+    mean=np.nanmean(stack,axis=0)
+    if not np.any(np.isfinite(mean)):return None,None
+    # Fill edge NaNs introduced only by shifting with the closest finite sample;
+    # the central event region remains supported by all/most captures.
+    finite=np.flatnonzero(np.isfinite(mean))
+    if len(finite):
+        mean[:finite[0]]=mean[finite[0]];mean[finite[-1]+1:]=mean[finite[-1]]
+        missing=np.flatnonzero(~np.isfinite(mean))
+        if len(missing):mean[missing]=np.interp(missing,finite,mean[finite])
+
     b1=max(origin,1);b0=max(0,b1-template_baseline)
     base=float(np.mean(mean[b0:b1])) if b1>b0 else float(mean[origin])
     mean=mean-base;base=0.0
 
-    # Search the complete post-zero event region.  Absolute location now comes
-    # from AxoGraph's capture coordinate rather than a template-peak guess.
     spike_left=max(0,origin-template_baseline)
     spike_right=min(len(mean)-1,origin+max(int(.008*fs),1))
     peak=spike_left+int(np.argmax(mean[spike_left:spike_right+1]))
