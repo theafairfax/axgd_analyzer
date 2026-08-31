@@ -65,7 +65,7 @@ class TemplateConfig:
     amplitude_reject_mv: float = 20.0  # events smaller than this are dropped
     latency_start_ms: float = 20.0    # ignore events before this (from step onset)
     latency_end_ms: Optional[float] = 530.0  # ignore events after this (from step onset)
-    n_episodes: int = 10              # number of sweeps to pool for "Captured Aps"
+    n_episodes: int = 20              # number of sweeps to pool for "Captured APs"
     burst_window_ms: float = 20.0     # ISI window defining a burst at rheobase
     voltage_threshold_pct: float = 0.10  # fraction of max dV/dt defining AP onset (note D8)
 
