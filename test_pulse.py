@@ -1,28 +1,18 @@
-"""Passive membrane analysis that mirrors the AxoGraph Test Cell workflow.
+"""Passive membrane analysis mirroring AxoGraph's 'Measure Rs, Rm and Cm'.
 
-Lab workflow:
-  1. average all 20 repeats of 0001 Test Pulse 1-Ch
-  2. run Electrophys -> Measure Rm, Rs, and Cm on the ensemble average
+The implementation follows the supplied AxoGraph AXT source rather than an
+empirical capacitance approximation.  The lab averages the test-pulse repeats
+first, so this module fits the ensemble-average trace as one AxoGraph episode.
 
-AxoGraph Test Setup defaults shown in the acquisition manual:
-  - Fit Double Exponential: ON
-  - After Pulse Onset Skip: 0.1 ms
-  - Then Fit Over: 5 ms
-
-The ensemble-average current is modeled as
-    I(t) = Iss + A1*exp(-t/tau1) + A2*exp(-t/tau2)
-with a single-exponential fallback when the second component is not warranted.
-Series resistance uses the fitted total current extrapolated to pulse onset,
-membrane resistance uses the steady-state current, and membrane capacitance is
-computed from the *initial slope* of the fitted transient.  For a double
-exponential this defines an effective early time constant
-
-    tau_eff = (A1 + A2) / (A1/tau1 + A2/tau2)
-
-and Cm = tau_eff / (Rs || Rm).  This preserves the effect of both fitted
-components at pulse onset without allowing a slow dendritic/distributed tail to
-dominate the capacitance estimate through full charge integration.  For a
-single exponential tau_eff is simply tau1.
+Relevant AxoGraph rules from Measure and Correct Rs.axtx:
+  * skipFitSamples = 1 + Round(0.2 ms / sampleInterval), minimum 2
+  * fit a double exponential plus constant first
+  * fall back to a single exponential plus constant when
+        t2 <= 0, t1 <= 0, t2 > 0.3*t1, or a1*a2 <= 0
+  * extrapolate fitted amplitudes back by (skipFitSamples-1)*dt
+  * Rs = |pulseSize / (a1+a2+steadyState)|
+  * Rm = |pulseSize / steadyState| - Rs
+  * Cm = t2 * (1/Rs + 1/Rm)
 """
 from __future__ import annotations
 from dataclasses import dataclass, field
@@ -55,30 +45,22 @@ def _find_test_pulse_window(signal,fs,expected_onset_ms=20.,expected_width_ms=40
     if len(x)<30 or fs<=0:return None,None
     w=max(int(round(.00005*fs)),1)
     smooth=np.convolve(x,np.ones(w)/w,mode='same') if w>1 else x
-    d=np.abs(np.diff(smooth))
-    radius=max(int(tolerance_ms/1000.*fs),3)
+    d=np.abs(np.diff(smooth));radius=max(int(tolerance_ms/1000.*fs),3)
     onset=_edge_near(d,expected_onset_ms/1000.*fs,radius)
     offset=_edge_near(d,(expected_onset_ms+expected_width_ms)/1000.*fs,radius)
-    if onset is not None and offset is not None and offset>onset+max(int(.005*fs),5):
-        return onset+1,offset+1
+    if onset is not None and offset is not None and offset>onset+max(int(.005*fs),5):return onset+1,offset+1
     return None,None
 
 
-def _single_exp(t_ms,a,tau):
-    return a*np.exp(-t_ms/tau)
-
-
-def _double_exp(t_ms,a1,tau1,a2,tau2):
-    return a1*np.exp(-t_ms/tau1)+a2*np.exp(-t_ms/tau2)
-
+def _single_plus(t,a,tau,c):return c+a*np.exp(-t/tau)
+def _double_plus(t,a1,t1,a2,t2,c):return c+a1*np.exp(-t/t1)+a2*np.exp(-t/t2)
 
 def _extract_current(sw):
     raw=sw.current if sw.current is not None else sw.voltage
     return None if raw is None else np.asarray(raw,dtype=float)
 
-
 def _ensemble_average(recording:Recording):
-    traces=[]; fs=None
+    traces=[];fs=None
     for sw in recording.sweeps:
         x=_extract_current(sw)
         if x is None or len(x)<20:continue
@@ -91,133 +73,90 @@ def _ensemble_average(recording:Recording):
     return np.mean(np.vstack([x[:n] for x in traces]),axis=0),fs,len(traces)
 
 
-def _fit_transient(t,z):
-    """AxoGraph-like double exponential with automatic single-exp fallback."""
-    try:
-        ps,_=curve_fit(_single_exp,t,z,p0=[float(z[0]),.5],
-                       bounds=([1e-9,.01],[np.inf,20.]),maxfev=30000)
-        pred_s=_single_exp(t,*ps)
-        rss_s=float(np.sum((z-pred_s)**2))
-    except Exception:
-        ps=None; rss_s=np.inf
+def _fit_axograph_transient(t_s,y):
+    """Double-exp-plus-constant with AxoGraph's explicit fallback rule.
 
-    amp0=max(float(z[0]),1e-9)
-    p0=[amp0*.65,.25,amp0*.35,1.5]
+    AxoGraph's returned t2 is the fast component in the accepted double fit
+    (its source requires t2 < 0.3*t1 and uses t2 for Cm).
+    """
+    y=np.asarray(y,dtype=float);t_s=np.asarray(t_s,dtype=float)
+    if len(y)<8:return None
+    c0=float(np.mean(y[-max(3,len(y)//10):]));amp0=float(y[0]-c0)
+    sign=1. if amp0>=0 else -1.
+    scale=max(abs(amp0),float(np.ptp(y)),1e-15)
     try:
-        pd,_=curve_fit(_double_exp,t,z,p0=p0,
-                       bounds=([0,.01,0,.05],[np.inf,5.,np.inf,30.]),maxfev=60000)
-        a1,t1,a2,t2=[float(v) for v in pd]
-        if t1>t2:a1,t1,a2,t2=a2,t2,a1,t1
-        pred_d=_double_exp(t,a1,t1,a2,t2)
-        rss_d=float(np.sum((z-pred_d)**2))
-        n=max(len(z),1)
-        bic_s=n*np.log(max(rss_s/n,1e-30))+2*np.log(n) if np.isfinite(rss_s) else np.inf
-        bic_d=n*np.log(max(rss_d/n,1e-30))+4*np.log(n)
-        frac=min(a1,a2)/max(a1+a2,1e-12)
-        separated=t2/max(t1,1e-12)>=1.5
-        if bic_d+2.0<bic_s and frac>=.02 and separated:
-            return {'model':'double','a1':a1,'tau1':t1,'a2':a2,'tau2':t2,'rss':rss_d,'pred':pred_d}
+        # Parameter order deliberately names the slow component t1 and fast t2
+        # to match AxoGraph's acceptance test and Cm=t2*(...).
+        p0=[sign*.35*scale,.002,sign*.65*scale,.0003,c0]
+        pd,_=curve_fit(_double_plus,t_s,y,p0=p0,
+            bounds=([-np.inf,1e-5,-np.inf,1e-5,-np.inf],[np.inf,.1,np.inf,.03,np.inf]),maxfev=100000)
+        a1,t1,a2,t2,c=[float(q) for q in pd]
+        # Normalize component labels so t2 is the faster component, as required
+        # by the AxoGraph source's t2 < 0.3*t1 test.
+        if t1<t2:a1,t1,a2,t2=a2,t2,a1,t1
+        if t2>0 and t1>0 and t2<=.3*t1 and a1*a2>0:
+            pred=_double_plus(t_s,a1,t1,a2,t2,c)
+            return {'model':'double','a1':a1,'t1':t1,'a2':a2,'t2':t2,'steady':c,'pred':pred}
     except Exception:
         pass
+    try:
+        ps,_=curve_fit(_single_plus,t_s,y,p0=[amp0,.0005,c0],
+            bounds=([-np.inf,1e-5,-np.inf],[np.inf,.1,np.inf]),maxfev=100000)
+        a2,t2,c=[float(q) for q in ps]
+        pred=_single_plus(t_s,a2,t2,c)
+        return {'model':'single','a1':0.,'t1':.001,'a2':a2,'t2':t2,'steady':c,'pred':pred}
+    except Exception:return None
 
-    if ps is None:return None
-    return {'model':'single','a1':float(ps[0]),'tau1':float(ps[1]),'a2':0.,'tau2':0.,'rss':rss_s,'pred':pred_s}
 
-
-def _measure_average_trace(x,fs,pulse_amplitude_mv,expected_onset_ms,expected_width_ms,
-                           skip_ms=.1,fit_over_ms=5.0):
+def _measure_average_trace(x,fs,pulse_amplitude_mv,expected_onset_ms,expected_width_ms):
     onset,offset=_find_test_pulse_window(x,fs,expected_onset_ms,expected_width_ms)
     if onset is None or offset is None:return None
-    pre_n=max(int(.005*fs),5)
-    baseline=float(np.mean(x[max(0,onset-pre_n):onset]))
-    pulse=np.asarray(x[onset:offset],dtype=float)-baseline
-    if len(pulse)<20:return None
-
-    early=min(max(int(.002*fs),8),len(pulse))
-    sign=1. if abs(np.max(pulse[:early]))>=abs(np.min(pulse[:early])) else -1.
-    y=pulse*sign
-
-    off_margin=max(int(.001*fs),1)
-    ss_start=max(int(len(y)*.5),0)
-    ss_end=max(len(y)-off_margin,ss_start+1)
-    iss=float(np.mean(y[ss_start:ss_end]))
-    if iss<=0:return None
-
-    raw_peak=float(np.max(y[:min(len(y),max(int(.0015*fs),10))]))
-    scale=1e12 if max(abs(raw_peak),abs(iss))<1e-3 else 1.
-    iss_pa=iss*scale; raw_peak_pa=raw_peak*scale
-
-    t_ms=np.arange(len(y),dtype=float)/fs*1000.
-    transient=(y-iss)*scale
-    fit_start=skip_ms
-    fit_end=skip_ms+fit_over_ms
-    mask=(t_ms>=fit_start)&(t_ms<=fit_end)&np.isfinite(transient)&(transient>0)
-    if np.count_nonzero(mask)<8:return None
-    tf=t_ms[mask]; z=transient[mask]
-    fit=_fit_transient(tf,z)
+    dt=1./fs
+    # Exact Measure Rs, Rm and Cm source convention: 0.2 ms, plus one sample.
+    skip_samples=max(1+int(round(.0002/dt)),2)
+    ref_start=max(0,onset-(offset-onset));ref_end=max(ref_start+1,onset-skip_samples)
+    fit_start=onset+skip_samples;fit_end=max(fit_start+8,offset-skip_samples)
+    fit_end=min(fit_end,len(x))
+    if fit_end-fit_start<8:return None
+    ref=np.asarray(x[ref_start:ref_end],dtype=float)
+    data=np.asarray(x[fit_start:fit_end],dtype=float)
+    baseline=float(np.mean(ref)) if len(ref) else 0.
+    # Fit raw data, just as FitDoubleExponential does; subtract the reference
+    # from only the returned steady-state constant afterward.
+    t=np.arange(len(data),dtype=float)*dt
+    fit=_fit_axograph_transient(t,data)
     if fit is None:return None
+    a1,t1,a2,t2,steady=fit['a1'],fit['t1'],fit['a2'],fit['t2'],fit['steady']
+    steady-=baseline
+    # AxoGraph fit starts at fitMin.  Its source extrapolates by
+    # (skipFitSamples-1)*sampleInterval to pulse onset.
+    extrap=(skip_samples-1)*dt
+    if t1>0:a1*=np.exp(extrap/t1)
+    if t2>0:a2*=np.exp(extrap/t2)
 
-    a1,t1,a2,t2=fit['a1'],fit['tau1'],fit['a2'],fit['tau2']
-    transient0_pa=a1+a2
-    i0_pa=iss_pa+transient0_pa
-    if i0_pa<=iss_pa:return None
-
-    rs=abs(pulse_amplitude_mv/i0_pa)*1000.
-    rtotal=abs(pulse_amplitude_mv/iss_pa)*1000.
-    rm=rtotal-rs
-    if not (1<rs<500 and 5<rm<5000):return None
-    rparallel=(rs*rm)/(rs+rm)
-    if rparallel<=0:return None
-
-    # Effective time constant defined by the fitted transient's initial slope:
-    # Itr(0) / -dItr/dt|0.  This is robust to a long slow component that would
-    # otherwise dominate integrated charge and grossly inflate Cm.
-    slope0=a1/max(t1,1e-12)+a2/max(t2,1e-12)
-    tau_effective=transient0_pa/max(slope0,1e-12)
-    cm=tau_effective*1000./rparallel
-    if not (1<cm<1000):return None
-
-    # Keep the full integrated transient as a diagnostic only. It reflects slow
-    # distributed charging and is intentionally not used for reported Cm.
-    q_fit_fc=a1*t1+a2*t2
-    divider=(rtotal/rm)**2
-    cm_charge_integral=q_fit_fc*divider/abs(pulse_amplitude_mv)
-    charge_weighted_tau=q_fit_fc/max(transient0_pa,1e-12)
-
-    pred=fit['pred']; ss_res=fit['rss']; ss_tot=float(np.sum((z-np.mean(z))**2))
-    r2=1.-ss_res/ss_tot if ss_tot>0 else np.nan
-
-    return {
-        'Trace':'20-sweep ensemble average','Model':fit['model'],
-        'Rs (MOhm)':rs,'Rm (MOhm)':rm,'Cm (pF)':cm,'Rtotal (MOhm)':rtotal,
-        'I0 fitted total (pA)':i0_pa,'I transient fitted (pA)':transient0_pa,
-        'I raw peak (pA)':raw_peak_pa,'I steady (pA)':iss_pa,
-        'A fast (pA)':a1,'Tau fast (ms)':t1,
-        'A slow (pA)':a2 if fit['model']=='double' else np.nan,
-        'Tau slow (ms)':t2 if fit['model']=='double' else np.nan,
-        'Tau effective initial-slope (ms)':tau_effective,
-        'Cm charge-integral diagnostic (pF)':cm_charge_integral,
-        'Tau charge-weighted diagnostic (ms)':charge_weighted_tau,
-        'Transient charge diagnostic (fC)':q_fit_fc,
-        'Fit R2':r2,'Skip after onset (ms)':skip_ms,'Fit over (ms)':fit_over_ms,
-        'Onset (ms)':onset/fs*1000.,'Offset (ms)':offset/fs*1000.
-    }
+    # Convert current units to amperes when the parser supplies pA-scale values.
+    magnitude=max(abs(a1),abs(a2),abs(steady),1e-30)
+    current_scale=1e-12 if magnitude>1e-3 else 1.
+    a1_a=a1*current_scale;a2_a=a2*current_scale;steady_a=steady*current_scale
+    pulse_v=pulse_amplitude_mv*1e-3
+    denom=a1_a+a2_a+steady_a
+    if denom==0 or steady_a==0:return None
+    rs=abs(pulse_v/denom)
+    rm=abs(pulse_v/steady_a)-rs
+    if rs<=0 or rm<=0:return None
+    cm=t2*(1./rs+1./rm)
+    rs_m=rs/1e6;rm_m=rm/1e6;cm_pf=cm*1e12
+    if not (1<rs_m<500 and 5<rm_m<5000 and 1<cm_pf<2000):return None
+    pred=np.asarray(fit['pred']);rss=float(np.sum((data-pred)**2));sst=float(np.sum((data-np.mean(data))**2));r2=1-rss/sst if sst>0 else np.nan
+    return {'Trace':'20-sweep ensemble average','Model':fit['model'],'Rs (MOhm)':rs_m,'Rm (MOhm)':rm_m,'Cm (pF)':cm_pf,
+            'A1 fitted':a1,'Tau1 (ms)':t1*1000.,'A2 fitted':a2,'Tau2 used for Cm (ms)':t2*1000.,
+            'Steady fitted':steady,'Fit R2':r2,'Skip after onset (ms)':skip_samples*dt*1000.,
+            'Onset (ms)':onset/fs*1000.,'Offset (ms)':offset/fs*1000.}
 
 
-def compute_test_pulse_properties(recording:Recording,pulse_amplitude_mv:float=10.,
-                                  expected_onset_ms:float=20.,expected_width_ms:float=40.)->TestPulseProperties:
+def compute_test_pulse_properties(recording:Recording,pulse_amplitude_mv:float=10.,expected_onset_ms:float=20.,expected_width_ms:float=40.)->TestPulseProperties:
     avg,fs,n=_ensemble_average(recording)
-    if avg is None:
-        return TestPulseProperties(n_total_sweeps=len(recording.sweeps),pulse_amplitude_mv=pulse_amplitude_mv,
-                                   expected_onset_ms=expected_onset_ms,expected_width_ms=expected_width_ms)
-    result=_measure_average_trace(avg,fs,pulse_amplitude_mv,expected_onset_ms,expected_width_ms,
-                                  skip_ms=.1,fit_over_ms=5.)
-    if result is None:
-        return TestPulseProperties(n_total_sweeps=len(recording.sweeps),n_valid_sweeps=n,
-                                   pulse_amplitude_mv=pulse_amplitude_mv,expected_onset_ms=expected_onset_ms,
-                                   expected_width_ms=expected_width_ms)
-    return TestPulseProperties(series_resistance=result['Rs (MOhm)'],
-        membrane_resistance=result['Rm (MOhm)'],membrane_capacitance=result['Cm (pF)'],
-        n_valid_sweeps=n,n_total_sweeps=len(recording.sweeps),sweep_values=[result],
-        pulse_amplitude_mv=pulse_amplitude_mv,expected_onset_ms=expected_onset_ms,
-        expected_width_ms=expected_width_ms)
+    if avg is None:return TestPulseProperties(n_total_sweeps=len(recording.sweeps),pulse_amplitude_mv=pulse_amplitude_mv,expected_onset_ms=expected_onset_ms,expected_width_ms=expected_width_ms)
+    result=_measure_average_trace(avg,fs,pulse_amplitude_mv,expected_onset_ms,expected_width_ms)
+    if result is None:return TestPulseProperties(n_total_sweeps=len(recording.sweeps),n_valid_sweeps=n,pulse_amplitude_mv=pulse_amplitude_mv,expected_onset_ms=expected_onset_ms,expected_width_ms=expected_width_ms)
+    return TestPulseProperties(series_resistance=result['Rs (MOhm)'],membrane_resistance=result['Rm (MOhm)'],membrane_capacitance=result['Cm (pF)'],n_valid_sweeps=n,n_total_sweeps=len(recording.sweeps),sweep_values=[result],pulse_amplitude_mv=pulse_amplitude_mv,expected_onset_ms=expected_onset_ms,expected_width_ms=expected_width_ms)
