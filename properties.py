@@ -5,7 +5,7 @@ import numpy as np
 from scipy.optimize import curve_fit
 from models import Recording,Sweep,SweepAnalysis,IntrinsicProperties,SpikeEventFeatures
 from protocol import detect_steps
-from spikes import detect_spikes,adaptation_index as _adaptation_index,detect_spikes_template,build_spike_event_features,build_ahp_event_features
+from spikes import adaptation_index as _adaptation_index,detect_spikes_template,build_spike_event_features,build_ahp_event_features
 from template_matching import TemplateConfig
 
 def _exp_decay(t,v_inf,delta,tau):return v_inf+delta*np.exp(-t/tau)
@@ -18,8 +18,12 @@ def _fit_tau(s):
         p,_=curve_fit(_exp_decay,t,v,p0=[float(v[-1]),float(s.voltage[o]-v[-1]),.02],maxfev=5000);tau=float(p[2]);return tau*1000 if .0005<tau<1 else None
     except:return None
 
-def _analyze_sweep(s):
-    spikes=detect_spikes(s);dur=s.step_duration or len(s.voltage)/s.sampling_rate;steady=defl=peak=sag=None
+def _analyze_sweep(s,template_cfg):
+    # Use the same AxoGraph-style template detector as Captured APs so F-I,
+    # rheobase, and AP Dynamics all count the same events. The former generic
+    # find_peaks path required peaks to exceed -10 mV and could therefore miss
+    # adapted APs later in high-current trains.
+    spikes=detect_spikes_template(s,template_cfg);dur=s.step_duration or len(s.voltage)/s.sampling_rate;steady=defl=peak=sag=None
     if s.step_onset_idx is not None and s.step_offset_idx is not None and not spikes:
         o,e=s.step_onset_idx,s.step_offset_idx;tail=max(e-int(.1*(e-o)),o);steady=float(np.mean(s.voltage[tail:e]));defl=steady-(s.baseline_voltage or 0.)
         if s.step_amplitude is not None and s.step_amplitude<0:
@@ -32,7 +36,7 @@ def _mean_event(es):
         x=[getattr(e,n) for e in es if getattr(e,n) is not None and np.isfinite(getattr(e,n))];return float(np.mean(x)) if x else np.nan
     return SpikeEventFeatures(peak_voltage=m('peak_voltage'),location_ms=m('location_ms'),onset_ms=m('onset_ms'),rise_ms=m('rise_ms'),width_ms=m('width_ms'),decay_ms=m('decay_ms'))
 def compute_properties(recording:Recording,template_cfg:TemplateConfig=TemplateConfig())->IntrinsicProperties:
-    detect_steps(recording);aa=[_analyze_sweep(s) for s in recording.sweeps]
+    detect_steps(recording);aa=[_analyze_sweep(s,template_cfg) for s in recording.sweeps]
     bs=[s.baseline_voltage for s in recording.sweeps if s.baseline_voltage is not None];rmp=float(np.median(bs)) if bs else None
     sub=[(a.step_amplitude,a.voltage_deflection) for a in aa if a.n_spikes==0 and a.voltage_deflection is not None and a.step_amplitude]
     rin=None
@@ -51,15 +55,15 @@ def compute_properties(recording:Recording,template_cfg:TemplateConfig=TemplateC
         last=recording.sweeps[-1]
         if last.step_offset_idx is not None:
             tail=last.voltage[min(last.step_offset_idx+int(.05*last.sampling_rate),len(last.voltage)):];post=float(np.median(tail)) if len(tail) else last.baseline_voltage
-    trains={};captured=0
-    for sw in recording.sweeps[:template_cfg.n_episodes]:
-        ts=detect_spikes_template(sw,template_cfg);trains[sw.index]=ts;captured+=len(ts)
+    # The first N sweeps are pooled only for the aggregate Captured APs metric.
+    # Per-sweep analyses above use the same detector across every sweep.
+    captured=sum(a.n_spikes for a in aa[:template_cfg.n_episodes])
     sev=aev=None;burst=nburst=None
     if rb:
         rs=next((s for s in recording.sweeps if s.index==rb.sweep_index),None)
         if rs is not None:
             # ONLY APs in the first (lowest-current) spiking sweep contribute to intrinsic AP/AHP summaries.
-            shape=rb.spikes or trains.get(rs.index,[]);o=rs.step_onset_idx or 0
+            shape=rb.spikes;o=rs.step_onset_idx or 0
             sev=_mean_event([build_spike_event_features(rs.voltage,rs.sampling_rate,x,o) for x in shape])
             aev=_mean_event([build_ahp_event_features(rs.voltage,rs.sampling_rate,x,o,rs.baseline_voltage) for x in shape])
             burst=any(x.isi_prev_ms is not None and x.isi_prev_ms<=template_cfg.burst_window_ms for x in shape[1:]);nburst=(1+sum(x.isi_prev_ms is not None and x.isi_prev_ms<=template_cfg.burst_window_ms for x in shape[1:])) if shape else 0

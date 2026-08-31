@@ -49,7 +49,7 @@ with st.sidebar:
     st.header("4. AP Detection")
     tm_threshold=st.number_input("Template detection threshold",.1,20.,1.,.1);tm_min_sep=st.number_input("Min separation (ms)",.1,50.,2.,.1)
     tm_amp_reject=st.number_input("Reject amplitude below (mV)",0.,100.,20.,1.);tm_latency_start=st.number_input("Search from (ms)",0.,1000.,20.,1.)
-    tm_latency_end=st.number_input("Search until (ms)",1.,5000.,530.,1.);tm_n_episodes=st.number_input("Episodes pooled for Captured APs",1,100,10,1)
+    tm_latency_end=st.number_input("Search until (ms)",1.,5000.,530.,1.);tm_n_episodes=st.number_input("Sweeps Pooled for Captured APs",1,100,20,1)
     tm_burst_window=st.number_input("Burst ISI window (ms)",1.,200.,20.,1.);tm_voltage_thresh_pct=st.slider("AP threshold (% max dV/dt)",.01,.5,.10,.01)
 cfg=TemplateConfig(threshold=tm_threshold,min_separation_ms=tm_min_sep,amplitude_reject_mv=tm_amp_reject,latency_start_ms=tm_latency_start,
     latency_end_ms=tm_latency_end,n_episodes=int(tm_n_episodes),burst_window_ms=tm_burst_window,voltage_threshold_pct=tm_voltage_thresh_pct)
