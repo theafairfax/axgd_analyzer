@@ -18,6 +18,21 @@ def _fit_tau(s):
         p,_=curve_fit(_exp_decay,t,v,p0=[float(v[-1]),float(s.voltage[o]-v[-1]),.02],maxfev=5000);tau=float(p[2]);return tau*1000 if .0005<tau<1 else None
     except:return None
 
+def _stable_post_step_voltage(s,settle_ms=20.0):
+    """Return stable post-step membrane voltage for AxoGraph-style RMP Pre.
+
+    The validation recordings show that the manual RMP value is taken from the
+    recovered voltage after the 500 ms command step, not from the early pre-step
+    region (which can still contain a large acquisition transient). Exclude a
+    short settling interval after step offset, then use the remaining tail.
+    """
+    if s.step_offset_idx is None or s.sampling_rate<=0:return None
+    start=int(s.step_offset_idx)+max(int(round(settle_ms/1000.*s.sampling_rate)),1)
+    if start>=len(s.voltage):return None
+    tail=np.asarray(s.voltage[start:],dtype=float)
+    tail=tail[np.isfinite(tail)]
+    return float(np.mean(tail)) if len(tail) else None
+
 def _analyze_sweep(s,template_cfg):
     spikes=detect_spikes_template(s,template_cfg);dur=s.step_duration or len(s.voltage)/s.sampling_rate;steady=defl=peak=sag=None
     if s.step_onset_idx is not None and s.step_offset_idx is not None and not spikes:
@@ -33,7 +48,10 @@ def _mean_event(es):
     return SpikeEventFeatures(peak_voltage=m('peak_voltage'),location_ms=m('location_ms'),onset_ms=m('onset_ms'),rise_ms=m('rise_ms'),width_ms=m('width_ms'),decay_ms=m('decay_ms'))
 def compute_properties(recording:Recording,template_cfg:TemplateConfig=TemplateConfig())->IntrinsicProperties:
     detect_steps(recording);aa=[_analyze_sweep(s,template_cfg) for s in recording.sweeps]
-    bs=[s.baseline_voltage for s in recording.sweeps if s.baseline_voltage is not None];rmp=float(np.median(bs)) if bs else None
+    post_rmp=[_stable_post_step_voltage(s) for s in recording.sweeps]
+    post_rmp=[x for x in post_rmp if x is not None and np.isfinite(x)]
+    bs=[s.baseline_voltage for s in recording.sweeps if s.baseline_voltage is not None]
+    rmp=float(np.mean(post_rmp)) if post_rmp else (float(np.median(bs)) if bs else None)
     sub=[(a.step_amplitude,a.voltage_deflection) for a in aa if a.n_spikes==0 and a.voltage_deflection is not None and a.step_amplitude]
     rin=None
     if len(sub)>=2:
@@ -46,23 +64,15 @@ def compute_properties(recording:Recording,template_cfg:TemplateConfig=TemplateC
     fi=sorted([(a.step_amplitude,a.n_spikes) for a in aa],key=lambda x:x[0]);maxfr=max((a.firing_rate_hz for a in aa),default=None);slope=None;pos=[x for x in fi if x[0]>0]
     if len(pos)>=2 and recording.sweeps and recording.sweeps[0].step_duration:
         c=np.array([x[0] for x in pos]);n=np.array([x[1] for x in pos]);slope=float(np.polyfit(c,n,1)[0])/recording.sweeps[0].step_duration if np.ptp(c)>0 else None
-    pre=recording.sweeps[0].baseline_voltage if recording.sweeps else None;post=None
+    pre=rmp;post=None
     if recording.sweeps:
-        last=recording.sweeps[-1]
-        if last.step_offset_idx is not None:
-            tail=last.voltage[min(last.step_offset_idx+int(.05*last.sampling_rate),len(last.voltage)):];post=float(np.median(tail)) if len(tail) else last.baseline_voltage
+        last=recording.sweeps[-1];post=_stable_post_step_voltage(last)
     captured=sum(a.n_spikes for a in aa[:template_cfg.n_episodes])
     sev=aev=None;burst=nburst=None
     if rb:
         rs=next((s for s in recording.sweeps if s.index==rb.sweep_index),None)
         if rs is not None:
-            # AxoGraph's captured-event workflow operates on the waveform made
-            # from the detected rheobase events. Reproduce that order: capture
-            # each detected AP, align on its peak, average the voltage traces,
-            # then measure SPIKE and AHP shapes on that single mean waveform.
-            # This is intentionally different from averaging per-AP shape
-            # measurements, which is nonlinear for rise/width/decay crossings.
-            sev,aev=build_average_rheobase_event_features(rs.voltage,rs.sampling_rate,rb.spikes)
+            sev,aev=build_average_rheobase_event_features(rs.voltage,rs.sampling_rate,rb.spikes,template_cfg=template_cfg)
             burst=any(x.isi_prev_ms is not None and x.isi_prev_ms<=template_cfg.burst_window_ms for x in rb.spikes[1:]);nburst=(1+sum(x.isi_prev_ms is not None and x.isi_prev_ms<=template_cfg.burst_window_ms for x in rb.spikes[1:])) if rb.spikes else 0
     return IntrinsicProperties(resting_membrane_potential=rmp,input_resistance=rin,membrane_tau=tau,membrane_capacitance=(tau*1000/rin if tau is not None and rin else None),sag_ratio=sag,rheobase=rheo,first_spike_threshold=thr,first_spike_amplitude=amp,first_spike_half_width=hw,max_firing_rate_hz=maxfr,fi_slope=slope,adaptation_index=rb.adaptation_index if rb and rb.n_spikes>=3 else None,fi_curve=fi,sweep_analyses=aa,series_resistance=None,membrane_resistance=rin,rmp_pre=pre,rmp_post=post,captured_aps=captured,spike_event=sev,ahp_event=aev,has_burst_at_rheobase=burst,n_burst_events_at_rheobase=nburst)
 def compute_phase_plane(time_ms,voltage_mv):return voltage_mv,np.gradient(voltage_mv)/np.gradient(time_ms)
