@@ -5,12 +5,26 @@ from __future__ import annotations
 import numpy as np
 from models import Recording, Sweep
 
+# Standard 500 ms DG tight-rheobase protocol used for recordings where the
+# command-current channel was not saved. The validated protocol increases by
+# 10 pA per sweep: sweep 4=92 pA, 5=102, 6=112, 7=122, 8=132, 9=142.
+# With zero-based Sweep.index this is equivalent to 52 + 10*index pA.
+DEFAULT_RHEOBASE_START_PA = 52.0
+DEFAULT_RHEOBASE_INCREMENT_PA = 10.0
+DEFAULT_RHEOBASE_ONSET_FRACTION = 0.10
+DEFAULT_RHEOBASE_OFFSET_FRACTION = 0.70
+
+
+def assumed_rheobase_current_pA(sweep_index: int) -> float:
+    """Return the standard protocol's injected current for a sweep index."""
+    return DEFAULT_RHEOBASE_START_PA + DEFAULT_RHEOBASE_INCREMENT_PA * float(sweep_index)
+
 
 def _find_step_edges(current: np.ndarray, fs: float):
     """Return the onset/offset pair for the dominant square current step.
 
     Looking for the largest *absolute* derivative alone is ambiguous because the
-    onset and offset of a square pulse have nearly identical magnitudes.  If the
+    onset and offset of a square pulse have nearly identical magnitudes. If the
     falling edge wins by a small amount, the old implementation interpreted it
     as the onset and could report the pulse with the wrong sign.
     """
@@ -20,9 +34,6 @@ def _find_step_edges(current: np.ndarray, fs: float):
 
     min_dur = max(int(0.02 * fs), 1)
     abs_di = np.abs(di)
-    # Consider the strongest transitions, then choose the pair whose intervening
-    # plateau differs most from the surrounding baseline. This works for both
-    # depolarizing and hyperpolarizing protocols without imposing a sign.
     n_candidates = min(12, len(abs_di))
     candidates = np.argpartition(abs_di, -n_candidates)[-n_candidates:]
     candidates = np.sort(candidates)
@@ -48,7 +59,6 @@ def _find_step_edges(current: np.ndarray, fs: float):
     if best is not None:
         return best[1], best[2]
 
-    # Conservative fallback if no valid pair was found.
     onset = int(np.argmax(abs_di))
     if onset + min_dur < len(di):
         offset = onset + min_dur + int(np.argmax(abs_di[onset + min_dur:]))
@@ -59,9 +69,11 @@ def _find_step_edges(current: np.ndarray, fs: float):
 
 def detect_steps(recording: Recording) -> None:
     """
-    Detects current-step onset, offset, baseline, and step amplitude across sweeps.
-    If a current command channel exists, paired current transitions define the
-    pulse window. Otherwise, it infers the step window from voltage deflections.
+    Detect current-step onset, offset, baseline, and step amplitude.
+
+    Recorded current always takes precedence. If the command-current channel is
+    absent or flat, use the standard DG tight-rheobase protocol amplitudes so
+    rheobase/F-I analyses remain meaningful for voltage-only acquisitions.
     """
     if not recording.sweeps:
         return
@@ -70,7 +82,7 @@ def detect_steps(recording: Recording) -> None:
         fs = sweep.sampling_rate
         v = sweep.voltage
 
-        if sweep.current is not None and np.ptp(sweep.current) > 5.0:  # Current channel available (>5 pA range)
+        if sweep.current is not None and np.ptp(sweep.current) > 5.0:
             i = sweep.current
             onset, offset = _find_step_edges(i, fs)
             if onset is None or offset is None:
@@ -89,10 +101,13 @@ def detect_steps(recording: Recording) -> None:
             sweep.step_amplitude = step_i - baseline_i
             sweep.baseline_voltage = baseline_v
         else:
-            # Fallback heuristic: assume step is in the middle 60-80% of recording or default window
-            default_onset = int(0.1 * len(v))
-            default_offset = int(0.7 * len(v))
+            # Voltage-only acquisition: use the known fixed rheobase protocol.
+            # Keep the same default pulse window previously used by the app for
+            # these files, but assign the true protocol current instead of 0 pA.
+            default_onset = int(DEFAULT_RHEOBASE_ONSET_FRACTION * len(v))
+            default_offset = int(DEFAULT_RHEOBASE_OFFSET_FRACTION * len(v))
             sweep.step_onset_idx = default_onset
             sweep.step_offset_idx = default_offset
+            sweep.baseline_current = 0.0
             sweep.baseline_voltage = float(np.median(v[:default_onset])) if default_onset > 0 else float(v[0])
-            sweep.step_amplitude = 0.0
+            sweep.step_amplitude = assumed_rheobase_current_pA(sweep.index)
