@@ -22,8 +22,15 @@ def _fmt(x):
     if isinstance(x,bool):return "Yes" if x else "No"
     return f"{x:.3f}" if isinstance(x,float) else str(x)
 
-def plot_phase_plane(v,d):
-    fig,ax=plt.subplots(figsize=(5,4));ax.plot(v,d,lw=1);ax.set_xlabel("Membrane potential (mV)");ax.set_ylabel("dV/dt (mV/ms = V/s)");ax.grid(alpha=.3);return fig
+def plot_phase_planes(sweeps):
+    fig,ax=plt.subplots(figsize=(6,5))
+    for s in sweeps:
+        v,d=compute_phase_plane(s.time*1000,s.voltage)
+        label=f"Sweep {s.index}" if s.step_amplitude is None else f"Sweep {s.index} ({s.step_amplitude:.0f} pA)"
+        ax.plot(v,d,lw=1,label=label)
+    ax.set_xlabel("Membrane potential (mV)");ax.set_ylabel("dV/dt (mV/ms = V/s)");ax.grid(alpha=.3)
+    if sweeps:ax.legend(fontsize="small")
+    return fig
 
 st.set_page_config(page_title="AxoGraph Patch-Clamp Analyzer",layout="wide")
 st.title("AxoGraph (.axgd) Current Clamp Analyzer")
@@ -65,7 +72,9 @@ else:
             idxs=[s.index for s in rheo_rec.sweeps];selected=st.multiselect("Sweeps",idxs,default=idxs[:min(5,len(idxs))])
             fig,(av,ai)=plt.subplots(2,1,figsize=(10,6),sharex=True)
             for idx in selected:
-                s=rheo_rec.sweeps[idx];label=f"Sweep {idx}" if s.step_amplitude is None else f"Sweep {idx} ({s.step_amplitude:.0f} pA)";av.plot(s.time*1000,s.voltage,label=label)
+                s=next((sw for sw in rheo_rec.sweeps if sw.index==idx),None)
+                if s is None:continue
+                label=f"Sweep {idx}" if s.step_amplitude is None else f"Sweep {idx} ({s.step_amplitude:.0f} pA)";av.plot(s.time*1000,s.voltage,label=label)
                 if s.current is not None:ai.plot(s.time*1000,s.current)
             av.legend(fontsize="small");av.set_ylabel("Voltage (mV)");ai.set_ylabel("Current (pA)");ai.set_xlabel("Time (ms)");st.pyplot(fig);plt.close(fig)
         with tab_fi:
@@ -78,14 +87,28 @@ else:
             st.caption("SPIKE/AHP Peak columns are event amplitudes (AxoGraph-style), not absolute Vm. They are averaged across all APs generated at rheobase. Absolute Vm remains visible in AP Dynamics.")
             st.dataframe(df,use_container_width=True,hide_index=True);st.download_button("Download combined CSV",df.to_csv(index=False).encode(),file_name=f"{cell_id or 'cell'}_combined_properties.csv",mime="text/csv")
         with tab_ap:
-            if props.rheobase is None:st.info("No rheobase AP detected.")
+            spiking_analyses=[a for a in props.sweep_analyses if a.n_spikes>0]
+            if not spiking_analyses:st.info("No AP-producing sweeps detected.")
             else:
-                rb=next((s for s in rheo_rec.sweeps if np.isclose(s.step_amplitude,props.rheobase,atol=.5)),None);analysis=next((a for a in props.sweep_analyses if rb is not None and a.sweep_index==rb.index),None)
-                if rb is not None and analysis is not None:
-                    st.subheader(f"Rheobase sweep: {props.rheobase:.1f} pA | {analysis.n_spikes} AP(s)")
-                    rows=[]
-                    for i,sp in enumerate(analysis.spikes,1):rows.append({"AP":i,"Absolute peak Vm (mV)":sp.peak_voltage,"Threshold Vm (mV)":sp.threshold_voltage,"AP amplitude (mV)":sp.amplitude,"Half-width (ms)":sp.half_width,"Max rise (mV/ms)":sp.max_rise_slope,"Max fall (mV/ms)":sp.max_fall_slope,"Absolute AHP trough Vm (mV)":sp.ahp_voltage,"AHP amplitude from threshold (mV)":(sp.ahp_voltage-sp.threshold_voltage) if sp.ahp_voltage is not None else np.nan})
+                analysis_by_idx={a.sweep_index:a for a in spiking_analyses};sweep_by_idx={s.index:s for s in rheo_rec.sweeps}
+                spiking_idxs=[a.sweep_index for a in spiking_analyses]
+                rb_idx=next((a.sweep_index for a in spiking_analyses if props.rheobase is not None and np.isclose(a.step_amplitude,props.rheobase,atol=.5)),spiking_idxs[0])
+                selected_ap_sweeps=st.multiselect("AP-producing sweeps",spiking_idxs,default=[rb_idx],format_func=lambda idx:f"Sweep {idx} ({analysis_by_idx[idx].step_amplitude:.0f} pA, {analysis_by_idx[idx].n_spikes} APs)")
+                if not selected_ap_sweeps:st.info("Select one or more AP-producing sweeps to view AP dynamics.")
+                else:
+                    rows=[];selected_sweeps=[]
+                    for idx in selected_ap_sweeps:
+                        analysis=analysis_by_idx[idx];sw=sweep_by_idx.get(idx)
+                        if sw is not None:selected_sweeps.append(sw)
+                        for i,sp in enumerate(analysis.spikes,1):rows.append({"Sweep":idx,"Current (pA)":analysis.step_amplitude,"AP":i,"Absolute peak Vm (mV)":sp.peak_voltage,"Threshold Vm (mV)":sp.threshold_voltage,"AP amplitude (mV)":sp.amplitude,"Half-width (ms)":sp.half_width,"Max rise (mV/ms)":sp.max_rise_slope,"Max fall (mV/ms)":sp.max_fall_slope,"Absolute AHP trough Vm (mV)":sp.ahp_voltage,"AHP amplitude from threshold (mV)":(sp.ahp_voltage-sp.threshold_voltage) if sp.ahp_voltage is not None else np.nan})
+                    st.subheader(f"Selected AP dynamics | {len(selected_ap_sweeps)} sweep(s) | {len(rows)} AP(s)")
                     if rows:
-                        apdf=pd.DataFrame(rows);st.dataframe(apdf,hide_index=True,use_container_width=True);st.write("**Rheobase AP averages**");st.dataframe(apdf.drop(columns=["AP"]).mean(numeric_only=True).to_frame("Mean").T,hide_index=True,use_container_width=True)
-                    v,d=compute_phase_plane(rb.time*1000,rb.voltage);fig=plot_phase_plane(v,d);st.pyplot(fig);plt.close(fig)
+                        apdf=pd.DataFrame(rows);st.dataframe(apdf,hide_index=True,use_container_width=True)
+                        st.write("**Per-sweep AP averages**")
+                        avg_cols=[c for c in apdf.columns if c not in ["Sweep","Current (pA)","AP"]]
+                        means=apdf.groupby(["Sweep","Current (pA)"],as_index=False)[avg_cols].mean(numeric_only=True);st.dataframe(means,hide_index=True,use_container_width=True)
+                        if len(selected_ap_sweeps)>1:
+                            st.write("**All selected AP averages**");st.dataframe(apdf[avg_cols].mean(numeric_only=True).to_frame("Mean").T,hide_index=True,use_container_width=True)
+                    st.write("**Superimposed phase plot**")
+                    fig=plot_phase_planes(selected_sweeps);st.pyplot(fig);plt.close(fig)
     except Exception as err:st.error(f"Error processing recordings: {err}")
