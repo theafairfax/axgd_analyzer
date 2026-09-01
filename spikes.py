@@ -2,7 +2,7 @@
 from __future__ import annotations
 from typing import List,Optional
 import numpy as np
-from scipy.signal import find_peaks
+from scipy.signal import find_peaks,savgol_filter
 from models import Sweep,SpikeFeatures,SpikeEventFeatures
 from template_matching import DEFAULT_TEMPLATE_MS,DEFAULT_TEMPLATE_MV,TemplateConfig,detect_events_by_template,detect_template_events
 
@@ -10,9 +10,17 @@ def _interp_cross(x0,y0,x1,y1,target):
     if y1==y0:return float(x0)
     return float(x0+(target-y0)*(x1-x0)/(y1-y0))
 
-def _spike_features_at_peak(v,dv,fs,global_idx,next_global_idx,prev_peak_time,rise_thresh_frac=.10):
+def _smoothed_dvdt(v,fs,window_ms=.0875,polyorder=3):
+    """Noise-stable dV/dt while preserving the fast AP upstroke at 80 kHz."""
+    n=max(int(round(window_ms/1000.*fs)),polyorder+2)
+    if n%2==0:n+=1
+    if n>=len(v):n=len(v)-1 if len(v)%2==0 else len(v)
+    if n<=polyorder:return np.gradient(v)*fs/1000.
+    return savgol_filter(np.asarray(v,dtype=float),n,polyorder,deriv=1,delta=1000./fs)
+
+def _spike_features_at_peak(v,dv,fs,global_idx,next_global_idx,prev_peak_time,rise_thresh_frac=.10,threshold_dvdt=20.):
     peak_time=global_idx/fs;peak_v=float(v[global_idx]);back=max(int(.005*fs),5);lo=max(global_idx-back,0)
-    rise=dv[lo:global_idx+1];max_rel=int(np.argmax(rise));max_rise=float(rise[max_rel]);target=rise_thresh_frac*max_rise
+    rise=dv[lo:global_idx+1];max_rel=int(np.argmax(rise));max_rise=float(rise[max_rel]);target=float(threshold_dvdt) if threshold_dvdt is not None else rise_thresh_frac*max_rise
     thr_idx=lo
     for j in range(max_rel,0,-1):
         if rise[j-1]<=target<rise[j]:thr_idx=lo+j-1;break
@@ -37,9 +45,9 @@ def detect_spikes(sweep:Sweep,min_peak_mv=-10.,min_prominence_mv=20.,refractory_
     start=sweep.step_onset_idx if sweep.step_onset_idx is not None else 0;end=sweep.step_offset_idx if sweep.step_offset_idx is not None else len(v)-1
     w=v[start:end+1];peaks,_=find_peaks(w,height=min_peak_mv,prominence=min_prominence_mv,distance=max(int(refractory_ms/1000*fs),1))
     if not len(peaks):return []
-    dv=np.gradient(v)*fs/1000.;out=[];prev=None
+    dv=_smoothed_dvdt(v,fs);out=[];prev=None
     for k,p in enumerate(peaks):
-        gi=start+int(p);nxt=start+int(peaks[k+1]) if k+1<len(peaks) else min(gi+int(.020*fs),end);sp=_spike_features_at_peak(v,dv,fs,gi,nxt,prev,.10);prev=sp.peak_time;out.append(sp)
+        gi=start+int(p);nxt=start+int(peaks[k+1]) if k+1<len(peaks) else min(gi+int(.020*fs),end);sp=_spike_features_at_peak(v,dv,fs,gi,nxt,prev,.10,20.);prev=sp.peak_time;out.append(sp)
     return out
 
 def detect_spikes_template(sweep:Sweep,cfg:TemplateConfig=TemplateConfig(),template_ms=DEFAULT_TEMPLATE_MS,template_mv=DEFAULT_TEMPLATE_MV)->List[SpikeFeatures]:
@@ -48,9 +56,9 @@ def detect_spikes_template(sweep:Sweep,cfg:TemplateConfig=TemplateConfig(),templ
     onset=sweep.step_onset_idx;ss=onset+int(cfg.latency_start_ms/1000*fs);se=min(onset+int(cfg.latency_end_ms/1000*fs),len(v)) if cfg.latency_end_ms is not None else (sweep.step_offset_idx or len(v))
     peaks=detect_events_by_template(v,fs,template_ms,template_mv,cfg,search_start_idx=max(ss,0),search_end_idx=se)
     if not len(peaks):return []
-    dv=np.gradient(v)*fs/1000.;out=[];prev=None
+    dv=_smoothed_dvdt(v,fs);out=[];prev=None
     for k,gi0 in enumerate(peaks):
-        gi=int(gi0);nxt=int(peaks[k+1]) if k+1<len(peaks) else min(gi+int(.020*fs),se-1);sp=_spike_features_at_peak(v,dv,fs,gi,nxt,prev,cfg.voltage_threshold_pct)
+        gi=int(gi0);nxt=int(peaks[k+1]) if k+1<len(peaks) else min(gi+int(.020*fs),se-1);sp=_spike_features_at_peak(v,dv,fs,gi,nxt,prev,cfg.voltage_threshold_pct,cfg.threshold_dvdt_mv_per_ms)
         if sp.amplitude>=cfg.amplitude_reject_mv:prev=sp.peak_time;out.append(sp)
     return out
 
@@ -70,20 +78,23 @@ def _shape(v,fs,peak_idx,baseline,polarity,left,right,time_origin_idx):
     t50a=_cross(v,fs,left,peak_idx,level(.50),up);t50b=_cross(v,fs,peak_idx,right,level(.50),down);pt=peak_idx/fs;origin=time_origin_idx/fs
     return SpikeEventFeatures(peak_voltage=signed_amp,location_ms=(pt-origin)*1000.,onset_ms=((t05-origin)*1000. if t05 is not None else np.nan),rise_ms=((t80-t20)*1000. if t20 is not None and t80 is not None else np.nan),width_ms=((t50b-t50a)*1000. if t50a is not None and t50b is not None else np.nan),decay_ms=((t50b-pt)*1000. if t50b is not None else np.nan))
 
-def _first_recovering_trough(v,fs,start,end,min_prominence_mv=.10):
+def _lowest_recovering_trough(v,fs,start,end,min_prominence_mv=.10):
     start=max(int(start),1);end=min(int(end),len(v)-2)
     if end<=start:return None
     w=np.asarray(v[start:end+1],dtype=float);distance=max(int(round(.00015*fs)),1)
     minima,_=find_peaks(-w,prominence=max(float(min_prominence_mv),0.),distance=distance)
+    valid=[]
     for rel in minima:
         idx=start+int(rel);recover_end=min(idx+max(int(round(.003*fs)),2),len(v)-1)
-        if recover_end>idx and np.max(v[idx+1:recover_end+1])>v[idx]+min_prominence_mv:return idx
+        if recover_end>idx and np.max(v[idx+1:recover_end+1])>v[idx]+min_prominence_mv:valid.append(idx)
+    if valid:return min(valid,key=lambda idx:v[idx])
     d=np.gradient(v)
+    valid=[]
     for idx in range(start+1,end):
         if d[idx-1]<0<=d[idx]:
             recover_end=min(idx+max(int(round(.002*fs)),2),len(v)-1)
-            if recover_end>idx and np.max(v[idx+1:recover_end+1])>v[idx]+min_prominence_mv:return idx
-    return None
+            if recover_end>idx and np.max(v[idx+1:recover_end+1])>v[idx]+min_prominence_mv:valid.append(idx)
+    return min(valid,key=lambda idx:v[idx]) if valid else None
 
 def _align_captures_at_onset(captures,fs,origin_idx,template_baseline_points,onset_sd_multiple=8.0):
     """Mirror AxoGraph's separate Align at Onset step before averaging.
@@ -179,10 +190,25 @@ def build_average_rheobase_event_features(v,fs,spikes,pre_ms=10.,post_ms=40.,tem
     later,_=find_peaks(mean[peak+max(int(.001*fs),1):],prominence=10.,distance=max(int(.001*fs),1))
     if len(later):next_peak=peak+max(int(.001*fs),1)+int(later[0])
     a0=min(peak+max(int(.00025*fs),1),len(mean)-1)
-    a1=min(len(mean)-2,origin+int(.008*fs))
+    # Search the full captured post-spike interval (up to the next AP). The
+    # target is the lowest post-spike voltage, not only an early fixed-window
+    # fAHP. A negative copy of the lab AP template supplies the AHP event onset
+    # and prevents ordinary AP repolarization from being reported as AHP rise.
+    a1=len(mean)-2
     if next_peak is not None:a1=min(a1,next_peak-1)
-    trough=_first_recovering_trough(mean,fs,a0,a1)
-    ahp=_shape(mean,fs,trough,0.0,-1,peak,min(len(mean)-1,trough+int(.008*fs)),origin) if trough is not None else None
+    negative_events=detect_template_events(mean,fs,DEFAULT_TEMPLATE_MS,-DEFAULT_TEMPLATE_MV,
+                                           template_cfg,a0,a1+1)
+    negative_events=[e for e in negative_events if a0<=e.peak_index<=a1]
+    trough=_lowest_recovering_trough(mean,fs,a0,a1)
+    ahp_left=peak
+    if negative_events:
+        selected=min(negative_events,key=lambda e:mean[e.peak_index])
+        if trough is None or mean[selected.peak_index]<mean[trough]:trough=selected.peak_index
+        # AxoGraph's detection coordinate follows the template's baseline.
+        # Step back by that baseline interval so the 5/20% AHP crossings are
+        # available for onset and rise measurements.
+        ahp_left=max(peak,min(selected.detection_index-template_baseline,trough))
+    ahp=_shape(mean,fs,trough,0.0,-1,ahp_left,len(mean)-1,origin) if trough is not None else None
     return spike,ahp
 
 def build_spike_event_features(v,fs,spike,step_onset_idx):

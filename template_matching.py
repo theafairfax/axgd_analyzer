@@ -15,6 +15,7 @@ analysis:
 from __future__ import annotations
 
 import os
+import struct
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
@@ -24,12 +25,36 @@ from scipy.signal import find_peaks, resample
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _DEFAULT_TEMPLATE_CSV = os.path.join(_HERE, "default_template.csv")
+_DEFAULT_TEMPLATE_AXGX = os.path.join(_HERE, "default_template.axgx")
 
 
 def _load_default_template() -> Tuple[np.ndarray, np.ndarray]:
     if os.path.exists(_DEFAULT_TEMPLATE_CSV):
         arr = np.loadtxt(_DEFAULT_TEMPLATE_CSV, delimiter=",", skiprows=1)
         return arr[:, 0], arr[:, 1]
+    if os.path.exists(_DEFAULT_TEMPLATE_AXGX):
+        # The lab template is an AxoGraph exchange file containing explicit
+        # time and voltage columns (both type 7), rather than a type-9 series
+        # column. Preserve the original points used by AxoGraph Events.
+        raw = open(_DEFAULT_TEMPLATE_AXGX, "rb").read()
+        if raw[:4] != b"axgx":
+            raise ValueError("default_template.axgx is not an AxoGraph exchange file")
+        n_columns = struct.unpack(">l", raw[8:12])[0]
+        pos, columns = 12, []
+        for _ in range(n_columns):
+            n, column_type, title_len = struct.unpack(">lll", raw[pos:pos + 12])
+            pos += 12 + title_len
+            if column_type == 9:
+                start, increment = struct.unpack(">dd", raw[pos:pos + 16])
+                pos += 16
+                columns.append(start + np.arange(n) * increment)
+            else:
+                values = np.frombuffer(raw[pos:pos + 8 * n], dtype=">f8").astype(float)
+                pos += 8 * n
+                columns.append(values)
+        if len(columns) < 2 or len(columns[0]) != len(columns[1]):
+            raise ValueError("default_template.axgx must contain time and voltage columns")
+        return columns[0] * 1000.0, columns[1]
     fs = 80000.0
     t_ms = (np.arange(400) / fs) * 1000.0 - 0.9875
     v = np.zeros_like(t_ms)
@@ -61,6 +86,7 @@ class TemplateConfig:
     n_episodes: int = 20
     burst_window_ms: float = 20.0
     voltage_threshold_pct: float = 0.10
+    threshold_dvdt_mv_per_ms: Optional[float] = 20.0
     # AxoGraph captured-event window used by the lab workflow.  The source
     # code constructs x as (1-captureBaselinePoints)*dx and, for template
     # detection, captureOffset = captureBaselinePoints-templateBaselinePoints-1.
@@ -140,7 +166,15 @@ def detect_template_events(
     if len(detections) == 0:
         return []
 
-    peak_offset = int(round(DEFAULT_TEMPLATE_PEAK_OFFSET_MS / 1000.0 * fs))
+    # Infer event polarity from the supplied template. Positive AP detection is
+    # unchanged; a template multiplied by -1 detects AHPs and snaps to minima.
+    template_baseline = float(np.median(template_mv[:max(2, len(template_mv) // 10)]))
+    positive_excursion = float(np.max(template_mv) - template_baseline)
+    negative_excursion = float(template_baseline - np.min(template_mv))
+    polarity = 1 if positive_excursion >= negative_excursion else -1
+    extremum = int(np.argmax(template_mv) if polarity > 0 else np.argmin(template_mv))
+    peak_offset_ms = float(template_ms[extremum] - template_ms[0])
+    peak_offset = int(round(peak_offset_ms / 1000.0 * fs))
     tol = max(int(0.001 * fs), 1)
     out=[]
     for p0 in detections:
@@ -149,7 +183,7 @@ def detect_template_events(
         lo=max(approx-tol,0); hi=min(approx+tol+1,len(window))
         if hi<=lo:
             continue
-        local_peak=lo+int(np.argmax(window[lo:hi]))
+        local_peak=lo+int(np.argmax(window[lo:hi]) if polarity > 0 else np.argmin(window[lo:hi]))
         out.append(TemplateEvent(
             detection_index=p+search_start_idx,
             peak_index=local_peak+search_start_idx,
