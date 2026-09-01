@@ -2,13 +2,10 @@
 Current-step detection for patch-clamp sweeps.
 """
 from __future__ import annotations
+import re
 import numpy as np
 from models import Recording, Sweep
 
-# Standard 500 ms DG tight-rheobase protocol used for recordings where the
-# command-current channel was not saved. The validated protocol increases by
-# 10 pA per sweep: sweep 4=92 pA, 5=102, 6=112, 7=122, 8=132, 9=142.
-# With zero-based Sweep.index this is equivalent to 52 + 10*index pA.
 DEFAULT_RHEOBASE_START_PA = 52.0
 DEFAULT_RHEOBASE_INCREMENT_PA = 10.0
 DEFAULT_RHEOBASE_ONSET_FRACTION = 0.10
@@ -20,14 +17,33 @@ def assumed_rheobase_current_pA(sweep_index: int) -> float:
     return DEFAULT_RHEOBASE_START_PA + DEFAULT_RHEOBASE_INCREMENT_PA * float(sweep_index)
 
 
-def _find_step_edges(current: np.ndarray, fs: float):
-    """Return the onset/offset pair for the dominant square current step.
+def _protocol_pulse_parameters(notes: str):
+    """Extract onset, width, starting current and increment from AxoGraph notes."""
+    if not notes:
+        return None
+    match = re.search(
+        r"Pulse\s+#\d+\s*:\s*Current Command-\d+\s*[\r\n]+([^\r\n]+)",
+        notes,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return None
+    try:
+        values = [float(x) for x in match.group(1).split("\t") if x.strip()]
+        if len(values) < 13:
+            return None
+        onset_ms, width_ms, start_pa, increment_pa = (
+            values[3], values[5], values[11], values[12]
+        )
+        if onset_ms < 0 or width_ms <= 0:
+            return None
+        return onset_ms, width_ms, start_pa, increment_pa
+    except (TypeError, ValueError):
+        return None
 
-    Looking for the largest *absolute* derivative alone is ambiguous because the
-    onset and offset of a square pulse have nearly identical magnitudes. If the
-    falling edge wins by a small amount, the old implementation interpreted it
-    as the onset and could report the pulse with the wrong sign.
-    """
+
+def _find_step_edges(current: np.ndarray, fs: float):
+    """Return the onset/offset pair for the dominant square current step."""
     di = np.diff(current)
     if not len(di):
         return None, None
@@ -68,15 +84,11 @@ def _find_step_edges(current: np.ndarray, fs: float):
 
 
 def detect_steps(recording: Recording) -> None:
-    """
-    Detect current-step onset, offset, baseline, and step amplitude.
-
-    Recorded current always takes precedence. If the command-current channel is
-    absent or flat, use the standard DG tight-rheobase protocol amplitudes so
-    rheobase/F-I analyses remain meaningful for voltage-only acquisitions.
-    """
+    """Detect current-step onset, offset, baseline, and step amplitude."""
     if not recording.sweeps:
         return
+
+    protocol_pulse = _protocol_pulse_parameters(recording.protocol_notes)
 
     for sweep in recording.sweeps:
         fs = sweep.sampling_rate
@@ -101,13 +113,19 @@ def detect_steps(recording: Recording) -> None:
             sweep.step_amplitude = step_i - baseline_i
             sweep.baseline_voltage = baseline_v
         else:
-            # Voltage-only acquisition: use the known fixed rheobase protocol.
-            # Keep the same default pulse window previously used by the app for
-            # these files, but assign the true protocol current instead of 0 pA.
-            default_onset = int(DEFAULT_RHEOBASE_ONSET_FRACTION * len(v))
-            default_offset = int(DEFAULT_RHEOBASE_OFFSET_FRACTION * len(v))
+            if protocol_pulse is not None:
+                onset_ms, width_ms, start_pa, increment_pa = protocol_pulse
+                default_onset = int(round(onset_ms / 1000.0 * fs))
+                default_offset = int(round((onset_ms + width_ms) / 1000.0 * fs))
+                step_amplitude = start_pa + increment_pa * float(sweep.index)
+            else:
+                default_onset = int(DEFAULT_RHEOBASE_ONSET_FRACTION * len(v))
+                default_offset = int(DEFAULT_RHEOBASE_OFFSET_FRACTION * len(v))
+                step_amplitude = assumed_rheobase_current_pA(sweep.index)
+            default_onset = min(max(default_onset, 0), max(len(v) - 1, 0))
+            default_offset = min(max(default_offset, default_onset + 1), len(v))
             sweep.step_onset_idx = default_onset
             sweep.step_offset_idx = default_offset
             sweep.baseline_current = 0.0
             sweep.baseline_voltage = float(np.median(v[:default_onset])) if default_onset > 0 else float(v[0])
-            sweep.step_amplitude = assumed_rheobase_current_pA(sweep.index)
+            sweep.step_amplitude = step_amplitude
