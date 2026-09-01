@@ -91,7 +91,11 @@ class TemplateConfig:
     # code constructs x as (1-captureBaselinePoints)*dx and, for template
     # detection, captureOffset = captureBaselinePoints-templateBaselinePoints-1.
     capture_baseline_ms: float = 10.0
-    capture_ms: float = 15.0
+    capture_ms: float = 40.0
+    # Direct raw/captured pairs place AxoGraph's capture anchor 9--11 samples
+    # later than our criterion maximum at 80 kHz. Correct capture construction,
+    # while preserving AxoGraph time zero at captured index 799.
+    capture_anchor_correction_ms: float = 0.125
 
 
 @dataclass(frozen=True)
