@@ -163,8 +163,9 @@ def build_average_rheobase_event_features(v,fs,spikes,pre_ms=10.,post_ms=40.,tem
     capture_total=capture_baseline+capture_after
     capture_offset=capture_baseline-template_baseline-1
     captures=[]
+    anchor_correction=int(round(template_cfg.capture_anchor_correction_ms/1000.*fs))
     for e in matched:
-        first=e.detection_index-capture_offset
+        first=e.detection_index+anchor_correction-capture_offset
         last=first+capture_total
         if first>=0 and last<=len(v):captures.append(np.asarray(v[first:last],dtype=float))
     if not captures:return None,None
@@ -187,15 +188,10 @@ def build_average_rheobase_event_features(v,fs,spikes,pre_ms=10.,post_ms=40.,tem
     base=float(np.mean(mean[b0:b1])) if b1>b0 else float(mean[origin])
     mean=mean-base;base=0.0
 
-    # The batch comparison showed a nearly invariant +0.10 ms coordinate
-    # offset without a corresponding waveform error. Correct reporting only;
-    # capture alignment and the baseline window remain unchanged.
-    reporting_origin=origin+int(round(.00010*fs))
-
     spike_left=max(0,origin-template_baseline)
     spike_right=min(len(mean)-1,origin+max(int(.008*fs),1))
     peak=spike_left+int(np.argmax(mean[spike_left:spike_right+1]))
-    spike=_shape(mean,fs,peak,base,1,spike_left,min(len(mean)-1,peak+int(.006*fs)),reporting_origin)
+    spike=_shape(mean,fs,peak,base,1,spike_left,min(len(mean)-1,peak+int(.006*fs)),origin)
 
     next_peak=None
     later,_=find_peaks(mean[peak+max(int(.001*fs),1):],prominence=10.,distance=max(int(.001*fs),1))
@@ -205,13 +201,15 @@ def build_average_rheobase_event_features(v,fs,spikes,pre_ms=10.,post_ms=40.,tem
     # target is the lowest post-spike voltage, not only an early fixed-window
     # fAHP. A negative copy of the lab AP template supplies the AHP event onset
     # and prevents ordinary AP repolarization from being reported as AHP rise.
-    a1=len(mean)-2
+    # Preserve the 40 ms capture for recovery/drift diagnostics, but detect the
+    # physiological AHP in an early window so late drift cannot replace it.
+    a1=min(len(mean)-2,peak+max(int(round(.010*fs)),1))
     if next_peak is not None:a1=min(a1,next_peak-1)
     negative_events=detect_template_events(mean,fs,DEFAULT_TEMPLATE_MS,-DEFAULT_TEMPLATE_MV,
                                            template_cfg,a0,a1+1)
     negative_events=[e for e in negative_events if a0<=e.peak_index<=a1]
     trough=_lowest_recovering_trough(mean,fs,a0,a1)
-    ahp_left=peak;ahp_level_base=0.0
+    ahp_left=peak
     if negative_events:
         selected=min(negative_events,key=lambda e:mean[e.peak_index])
         # The inverted-template match is the primary AHP event. The generic
@@ -219,14 +217,10 @@ def build_average_rheobase_event_features(v,fs,spikes,pre_ms=10.,post_ms=40.,tem
         # fails, preventing a later oscillation from replacing the main AHP.
         trough=selected.peak_index
         ahp_left=max(peak,min(selected.detection_index-template_baseline,trough))
-        # Broad AHPs may not recover to the AP capture baseline. Use the stable
-        # tail as the fractional-level baseline for rise/width, while keeping
-        # AHP Peak referenced to the original event baseline (zero).
-        tail_start=max(trough+1,a1-template_baseline+1)
-        recovery=mean[tail_start:a1+1]
-        if len(recovery):ahp_level_base=float(np.median(recovery))
-    ahp=_shape(mean,fs,trough,0.0,-1,ahp_left,len(mean)-1,reporting_origin,
-               level_baseline=ahp_level_base) if trough is not None else None
+    # AHP Peak is a negative event amplitude from the established zero capture
+    # baseline. Never redefine fractional levels from a drifting late tail.
+    # Censor recovery at the next AP; an interrupted half-width remains NaN.
+    ahp=_shape(mean,fs,trough,0.0,-1,ahp_left,a1,origin) if trough is not None else None
     return spike,ahp
 
 def build_spike_event_features(v,fs,spike,step_onset_idx):
