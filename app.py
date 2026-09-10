@@ -59,6 +59,16 @@ def _combined_row(cell_label,meta,props,test_name,rheo_name):
          "Test Pulse File":test_name,"Rheobase File":rheo_name}
     row.update(props.to_flat_dict());return row
 
+def _test_pulse_row(cell_label,meta,tp,test_name):
+    row={"Cell":cell_label,"Type":meta.cell_type,"treatment":meta.condition,"DPI/Age":meta.age,"sex":meta.sex,
+         "Test Pulse File":test_name,"Rs (MOhm)":tp.series_resistance,"Rm (MOhm)":tp.membrane_resistance,
+         "Cm (pF)":tp.membrane_capacitance,"Accepted fits":f"{tp.n_valid_sweeps}/{tp.n_total_sweeps}"}
+    if tp.sweep_values:
+        detail=tp.sweep_values[0]
+        for key in ["Model","Fit R2","Tau1 (ms)","Tau2 used for Cm (ms)","Onset (ms)","Offset (ms)","Skip after onset (ms)"]:
+            if key in detail:row[key]=detail[key]
+    return row
+
 def _column_picker(df,key):
     """Return a view containing only columns selected for display/export."""
     cols=list(df.columns)
@@ -83,32 +93,65 @@ st.title("AxoGraph (.axgd) Current Clamp Analyzer")
 st.caption("Passive properties come from the dedicated test pulse; intrinsic AP/AHP shape uses only APs generated at rheobase.")
 with st.sidebar:
     st.header("1. Recordings")
-    upload_mode=st.radio("Upload mode",["Single cell","Batch combined export"],help="Batch mode intentionally produces only the Combined Export table/CSV.")
+    upload_mode=st.radio("Upload mode",["Single cell","Batch combined export","Bulk test pulse QC"],
+        help="Single cell combines test pulse + rheobase. Batch combined export analyzes paired files. Bulk test pulse QC analyzes passive membrane properties from test-pulse files only.")
     if upload_mode=="Single cell":
         test_file=st.file_uploader("Test pulse .axgd (usually 001)",type=["axgd","axgx"],key="test")
         rheo_file=st.file_uploader("Step current / rheobase .axgd",type=["axgd","axgx"],key="rheo")
-        batch_test_files=[];batch_rheo_files=[]
-    else:
+        batch_test_files=[];batch_rheo_files=[];qc_test_files=[]
+    elif upload_mode=="Batch combined export":
         batch_test_files=st.file_uploader("Test pulse files",type=["axgd","axgx"],accept_multiple_files=True,key="batch_tests") or []
         batch_rheo_files=st.file_uploader("Step current / rheobase files",type=["axgd","axgx"],accept_multiple_files=True,key="batch_rheos") or []
-        test_file=rheo_file=None
+        test_file=rheo_file=None;qc_test_files=[]
+    else:
+        qc_test_files=st.file_uploader("Test pulse files",type=["axgd","axgx"],accept_multiple_files=True,key="qc_tests") or []
+        test_file=rheo_file=None;batch_test_files=[];batch_rheo_files=[]
     st.header("2. Metadata")
-    cell_id=st.text_input("Cell ID","Cell_01",help="In batch mode the filename-derived cell label is used instead.");condition=st.text_input("Condition / treatment","");cell_type=st.text_input("Cell Type","")
+    cell_id=st.text_input("Cell ID","Cell_01",help="In batch modes the filename-derived cell label is used instead.");condition=st.text_input("Condition / treatment","");cell_type=st.text_input("Cell Type","")
     animal_id=st.text_input("Animal ID","");age=st.text_input("DPI / Age","");sex=st.text_input("Sex","");notes=st.text_area("Notes","")
     st.header("3. Test Pulse")
     pulse_mv=st.number_input("Voltage command amplitude (mV)",.1,100.,10.,.5)
     pulse_onset=st.number_input("Expected pulse onset (ms)",0.,500.,20.,1.)
     pulse_width=st.number_input("Expected pulse width (ms)",1.,500.,40.,1.,help="The supplied 0001 Test Pulse recordings show an approximately 20-60 ms pulse.")
-    st.header("4. AP Detection")
-    tm_threshold=st.number_input("Template detection threshold",.1,20.,1.,.1);tm_min_sep=st.number_input("Min separation (ms)",.1,50.,2.,.1)
-    tm_amp_reject=st.number_input("Reject amplitude below (mV)",0.,100.,20.,1.);tm_latency_start=st.number_input("Search from (ms)",0.,1000.,20.,1.)
-    tm_latency_end=st.number_input("Search until (ms)",1.,5000.,530.,1.);tm_n_episodes=st.number_input("Sweeps Pooled for Captured APs",1,100,20,1)
-    tm_burst_window=st.number_input("Burst ISI window (ms)",1.,200.,20.,1.);tm_voltage_thresh_pct=st.slider("AP threshold (% max dV/dt)",.01,.5,.10,.01)
+    if upload_mode!="Bulk test pulse QC":
+        st.header("4. AP Detection")
+        tm_threshold=st.number_input("Template detection threshold",.1,20.,1.,.1);tm_min_sep=st.number_input("Min separation (ms)",.1,50.,2.,.1)
+        tm_amp_reject=st.number_input("Reject amplitude below (mV)",0.,100.,20.,1.);tm_latency_start=st.number_input("Search from (ms)",0.,1000.,20.,1.)
+        tm_latency_end=st.number_input("Search until (ms)",1.,5000.,530.,1.);tm_n_episodes=st.number_input("Sweeps Pooled for Captured APs",1,100,20,1)
+        tm_burst_window=st.number_input("Burst ISI window (ms)",1.,200.,20.,1.);tm_voltage_thresh_pct=st.slider("AP threshold (% max dV/dt)",.01,.5,.10,.01)
+    else:
+        tm_threshold=1.;tm_min_sep=2.;tm_amp_reject=20.;tm_latency_start=20.;tm_latency_end=530.;tm_n_episodes=20;tm_burst_window=20.;tm_voltage_thresh_pct=.10
 cfg=TemplateConfig(threshold=tm_threshold,min_separation_ms=tm_min_sep,amplitude_reject_mv=tm_amp_reject,latency_start_ms=tm_latency_start,
     latency_end_ms=tm_latency_end,n_episodes=int(tm_n_episodes),burst_window_ms=tm_burst_window,voltage_threshold_pct=tm_voltage_thresh_pct)
 meta=Metadata(cell_id=cell_id,condition=condition,cell_type=cell_type,animal_id=animal_id,age=age,sex=sex,notes=notes)
 
-if upload_mode=="Batch combined export":
+if upload_mode=="Bulk test pulse QC":
+    st.header("Bulk Test Pulse QC")
+    st.caption("Upload test-pulse recordings only. Each file is analyzed independently with the same ensemble-average Rs, Rm, Cm method used in the Test Pulse QC tab; no rheobase file is required.")
+    if not qc_test_files:
+        st.info("Upload one or more test-pulse files to calculate passive membrane properties.")
+    else:
+        rows=[];errors=[]
+        with st.spinner(f"Analyzing {len(qc_test_files)} test-pulse file(s)..."):
+            for t in qc_test_files:
+                try:
+                    label=_batch_key(t.name) or _stem(t.name)
+                    batch_meta=Metadata(cell_id=label,condition=condition,cell_type=cell_type,animal_id=animal_id,age=age,sex=sex,notes=notes)
+                    test_rec=_load_data(t.getvalue(),t.name,batch_meta,cfg,"test")
+                    tp=compute_test_pulse_properties(test_rec,pulse_amplitude_mv=pulse_mv,expected_onset_ms=pulse_onset,expected_width_ms=pulse_width)
+                    if not tp.sweep_values:
+                        errors.append({"Test Pulse File":t.name,"Error":"No valid test-pulse transient detected. Verify command amplitude and expected pulse onset/width."})
+                        continue
+                    rows.append(_test_pulse_row(label,batch_meta,tp,t.name))
+                except Exception as err:errors.append({"Test Pulse File":t.name,"Error":str(err)})
+        if errors:
+            st.warning(f"{len(errors)} file(s) could not produce passive-property results.")
+            st.dataframe(pd.DataFrame(errors),hide_index=True,use_container_width=True)
+        if rows:
+            full_df=pd.DataFrame(rows);export_df=_column_picker(full_df,"bulk_test_pulse_columns")
+            st.dataframe(export_df,use_container_width=True,hide_index=True)
+            st.download_button("Download passive properties CSV",export_df.to_csv(index=False).encode(),file_name="bulk_test_pulse_properties.csv",mime="text/csv",disabled=export_df.shape[1]==0)
+elif upload_mode=="Batch combined export":
     st.header("Batch Combined Export")
     st.caption("Batch mode analyzes paired test-pulse/rheobase recordings and intentionally skips the QC, trace, F-I, and AP Dynamics tabs. Original filenames are retained in every output row.")
     if not batch_test_files or not batch_rheo_files:
