@@ -32,6 +32,7 @@ class TestPulseProperties:
     pulse_amplitude_mv: float = 10.0
     expected_onset_ms: float = 20.0
     expected_width_ms: float = 40.0
+    test_pulse_end_ms: Optional[float] = None
 
 
 def _edge_near(d, center_idx, radius):
@@ -40,15 +41,24 @@ def _edge_near(d, center_idx, radius):
     return lo+int(np.argmax(d[lo:hi]))
 
 
-def _find_test_pulse_window(signal,fs,expected_onset_ms=20.,expected_width_ms=40.,tolerance_ms=6.):
+def _find_test_pulse_window(signal,fs,expected_onset_ms=20.,expected_width_ms=40.,tolerance_ms=6.,test_pulse_end_ms=None):
     x=np.asarray(signal,dtype=float)
     if len(x)<30 or fs<=0:return None,None
     w=max(int(round(.00005*fs)),1)
     smooth=np.convolve(x,np.ones(w)/w,mode='same') if w>1 else x
     d=np.abs(np.diff(smooth));radius=max(int(tolerance_ms/1000.*fs),3)
     onset=_edge_near(d,expected_onset_ms/1000.*fs,radius)
+    if onset is None:return None,None
+    onset+=1
+    if test_pulse_end_ms is not None:
+        offset=int(round(float(test_pulse_end_ms)/1000.*fs))
+        offset=min(max(offset,onset+1),len(x))
+        if offset>onset+max(int(.005*fs),5):return onset,offset
+        return None,None
     offset=_edge_near(d,(expected_onset_ms+expected_width_ms)/1000.*fs,radius)
-    if onset is not None and offset is not None and offset>onset+max(int(.005*fs),5):return onset+1,offset+1
+    if offset is not None:
+        offset+=1
+        if offset>onset+max(int(.005*fs),5):return onset,offset
     return None,None
 
 
@@ -85,14 +95,10 @@ def _fit_axograph_transient(t_s,y):
     sign=1. if amp0>=0 else -1.
     scale=max(abs(amp0),float(np.ptp(y)),1e-15)
     try:
-        # Parameter order deliberately names the slow component t1 and fast t2
-        # to match AxoGraph's acceptance test and Cm=t2*(...).
         p0=[sign*.35*scale,.002,sign*.65*scale,.0003,c0]
         pd,_=curve_fit(_double_plus,t_s,y,p0=p0,
             bounds=([-np.inf,1e-5,-np.inf,1e-5,-np.inf],[np.inf,.1,np.inf,.03,np.inf]),maxfev=100000)
         a1,t1,a2,t2,c=[float(q) for q in pd]
-        # Normalize component labels so t2 is the faster component, as required
-        # by the AxoGraph source's t2 < 0.3*t1 test.
         if t1<t2:a1,t1,a2,t2=a2,t2,a1,t1
         if t2>0 and t1>0 and t2<=.3*t1 and a1*a2>0:
             pred=_double_plus(t_s,a1,t1,a2,t2,c)
@@ -108,11 +114,10 @@ def _fit_axograph_transient(t_s,y):
     except Exception:return None
 
 
-def _measure_average_trace(x,fs,pulse_amplitude_mv,expected_onset_ms,expected_width_ms):
-    onset,offset=_find_test_pulse_window(x,fs,expected_onset_ms,expected_width_ms)
+def _measure_average_trace(x,fs,pulse_amplitude_mv,expected_onset_ms,expected_width_ms,test_pulse_end_ms=None):
+    onset,offset=_find_test_pulse_window(x,fs,expected_onset_ms,expected_width_ms,test_pulse_end_ms=test_pulse_end_ms)
     if onset is None or offset is None:return None
     dt=1./fs
-    # Exact Measure Rs, Rm and Cm source convention: 0.2 ms, plus one sample.
     skip_samples=max(1+int(round(.0002/dt)),2)
     ref_start=max(0,onset-(offset-onset));ref_end=max(ref_start+1,onset-skip_samples)
     fit_start=onset+skip_samples;fit_end=max(fit_start+8,offset-skip_samples)
@@ -121,20 +126,14 @@ def _measure_average_trace(x,fs,pulse_amplitude_mv,expected_onset_ms,expected_wi
     ref=np.asarray(x[ref_start:ref_end],dtype=float)
     data=np.asarray(x[fit_start:fit_end],dtype=float)
     baseline=float(np.mean(ref)) if len(ref) else 0.
-    # Fit raw data, just as FitDoubleExponential does; subtract the reference
-    # from only the returned steady-state constant afterward.
     t=np.arange(len(data),dtype=float)*dt
     fit=_fit_axograph_transient(t,data)
     if fit is None:return None
     a1,t1,a2,t2,steady=fit['a1'],fit['t1'],fit['a2'],fit['t2'],fit['steady']
     steady-=baseline
-    # AxoGraph fit starts at fitMin.  Its source extrapolates by
-    # (skipFitSamples-1)*sampleInterval to pulse onset.
     extrap=(skip_samples-1)*dt
     if t1>0:a1*=np.exp(extrap/t1)
     if t2>0:a2*=np.exp(extrap/t2)
-
-    # Convert current units to amperes when the parser supplies pA-scale values.
     magnitude=max(abs(a1),abs(a2),abs(steady),1e-30)
     current_scale=1e-12 if magnitude>1e-3 else 1.
     a1_a=a1*current_scale;a2_a=a2*current_scale;steady_a=steady*current_scale
@@ -151,12 +150,13 @@ def _measure_average_trace(x,fs,pulse_amplitude_mv,expected_onset_ms,expected_wi
     return {'Trace':'20-sweep ensemble average','Model':fit['model'],'Rs (MOhm)':rs_m,'Rm (MOhm)':rm_m,'Cm (pF)':cm_pf,
             'A1 fitted':a1,'Tau1 (ms)':t1*1000.,'A2 fitted':a2,'Tau2 used for Cm (ms)':t2*1000.,
             'Steady fitted':steady,'Fit R2':r2,'Skip after onset (ms)':skip_samples*dt*1000.,
-            'Onset (ms)':onset/fs*1000.,'Offset (ms)':offset/fs*1000.}
+            'Onset (ms)':onset/fs*1000.,'Offset (ms)':offset/fs*1000.,
+            'Manual Test Pulse End (ms)':test_pulse_end_ms}
 
 
-def compute_test_pulse_properties(recording:Recording,pulse_amplitude_mv:float=10.,expected_onset_ms:float=20.,expected_width_ms:float=40.)->TestPulseProperties:
+def compute_test_pulse_properties(recording:Recording,pulse_amplitude_mv:float=10.,expected_onset_ms:float=20.,expected_width_ms:float=40.,test_pulse_end_ms:Optional[float]=None)->TestPulseProperties:
     avg,fs,n=_ensemble_average(recording)
-    if avg is None:return TestPulseProperties(n_total_sweeps=len(recording.sweeps),pulse_amplitude_mv=pulse_amplitude_mv,expected_onset_ms=expected_onset_ms,expected_width_ms=expected_width_ms)
-    result=_measure_average_trace(avg,fs,pulse_amplitude_mv,expected_onset_ms,expected_width_ms)
-    if result is None:return TestPulseProperties(n_total_sweeps=len(recording.sweeps),n_valid_sweeps=n,pulse_amplitude_mv=pulse_amplitude_mv,expected_onset_ms=expected_onset_ms,expected_width_ms=expected_width_ms)
-    return TestPulseProperties(series_resistance=result['Rs (MOhm)'],membrane_resistance=result['Rm (MOhm)'],membrane_capacitance=result['Cm (pF)'],n_valid_sweeps=n,n_total_sweeps=len(recording.sweeps),sweep_values=[result],pulse_amplitude_mv=pulse_amplitude_mv,expected_onset_ms=expected_onset_ms,expected_width_ms=expected_width_ms)
+    if avg is None:return TestPulseProperties(n_total_sweeps=len(recording.sweeps),pulse_amplitude_mv=pulse_amplitude_mv,expected_onset_ms=expected_onset_ms,expected_width_ms=expected_width_ms,test_pulse_end_ms=test_pulse_end_ms)
+    result=_measure_average_trace(avg,fs,pulse_amplitude_mv,expected_onset_ms,expected_width_ms,test_pulse_end_ms=test_pulse_end_ms)
+    if result is None:return TestPulseProperties(n_total_sweeps=len(recording.sweeps),n_valid_sweeps=n,pulse_amplitude_mv=pulse_amplitude_mv,expected_onset_ms=expected_onset_ms,expected_width_ms=expected_width_ms,test_pulse_end_ms=test_pulse_end_ms)
+    return TestPulseProperties(series_resistance=result['Rs (MOhm)'],membrane_resistance=result['Rm (MOhm)'],membrane_capacitance=result['Cm (pF)'],n_valid_sweeps=n,n_total_sweeps=len(recording.sweeps),sweep_values=[result],pulse_amplitude_mv=pulse_amplitude_mv,expected_onset_ms=expected_onset_ms,expected_width_ms=expected_width_ms,test_pulse_end_ms=test_pulse_end_ms)
