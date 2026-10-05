@@ -31,19 +31,30 @@ def _batch_key(name):
     s=_stem(name).strip()
     return re.sub(r"\s+\d+(?:\(\d+\))?$","",s).strip().lower()
 
+def _sequence_number(name):
+    import re
+    s=_stem(name).strip()
+    match=re.search(r"\\s+(\\d+)(?:\\(\\d+\\))?$",s)
+    return int(match.group(1)) if match else None
+
 def _pair_batch_files(test_files,rheo_files):
-    tests=list(test_files or []); rheos=list(rheo_files or [])
+    tests=list(test_files or []);rheos=list(rheo_files or [])
     pairs=[];used=set()
     for t in tests:
-        tk=_batch_key(t.name); candidates=[(i,r) for i,r in enumerate(rheos) if i not in used and _batch_key(r.name)==tk]
-        if len(candidates)==1:
-            i,r=candidates[0];used.add(i);pairs.append((t,r,"filename"))
-        else:pairs.append((t,None,"unmatched"))
+        tk=_batch_key(t.name)
+        candidates=[(i,r) for i,r in enumerate(rheos) if i not in used and _batch_key(r.name)==tk]
+        if candidates:
+            ordered=sorted(candidates,key=lambda x:(_sequence_number(x[1].name) is None,_sequence_number(x[1].name) or 0,x[0]))
+            for order,(i,r) in enumerate(ordered):
+                used.add(i)
+                role="Control" if order==0 else "Experimental / drug application"
+                pairs.append((t,r,"filename",role))
+        else:pairs.append((t,None,"unmatched","Unmatched"))
     remaining=[(i,r) for i,r in enumerate(rheos) if i not in used]
     unmatched=[i for i,p in enumerate(pairs) if p[1] is None]
     if len(unmatched)==len(remaining):
         for pi,(ri,r) in zip(unmatched,remaining):
-            t=pairs[pi][0];pairs[pi]=(t,r,"upload order");used.add(ri)
+            t=pairs[pi][0];pairs[pi]=(t,r,"upload order","Control");used.add(ri)
     return pairs,[r for i,r in enumerate(rheos) if i not in used]
 
 def _combined_row(cell_label,meta,props,test_name,rheo_name):
@@ -118,11 +129,11 @@ if upload_mode=="Bulk test pulse QC":
         if rows:
             full_df=pd.DataFrame(rows);export_df=_column_picker(full_df,"bulk_test_pulse_columns");st.dataframe(export_df,use_container_width=True,hide_index=True);st.download_button("Download passive properties CSV",export_df.to_csv(index=False).encode(),file_name="bulk_test_pulse_properties.csv",mime="text/csv",disabled=export_df.shape[1]==0)
 elif upload_mode=="Batch combined export":
-    st.header("Batch Combined Export");st.caption("Batch mode analyzes paired test-pulse/rheobase recordings and intentionally skips the QC, trace, F-I, and AP Dynamics tabs. Original filenames are retained in every output row.")
+    st.header("Batch Combined Export");st.caption("Batch mode analyzes paired test-pulse/rheobase recordings. Multiple rheobase files with the same filename stem share one test pulse; they are ordered by trailing sequence number, with the earliest labeled Control and later recordings labeled Experimental / drug application. Original filenames are retained in every output row.")
     if not batch_test_files or not batch_rheo_files:st.info("Upload one or more test-pulse files and the matching rheobase files.")
     else:
         pairs,unused_rheos=_pair_batch_files(batch_test_files,batch_rheo_files);preview=[]
-        for t,r,method in pairs:preview.append({"Test Pulse File":t.name,"Rheobase File":r.name if r else "UNMATCHED","Pairing":method})
+        for t,r,method,role in pairs:preview.append({"Test Pulse File":t.name,"Rheobase File":r.name if r else "UNMATCHED","Experimental Role":role,"Pairing":method})
         for r in unused_rheos:preview.append({"Test Pulse File":"UNMATCHED","Rheobase File":r.name,"Pairing":"unmatched"})
         st.write("**File pairing**");st.dataframe(pd.DataFrame(preview),hide_index=True,use_container_width=True);valid=[p for p in pairs if p[1] is not None]
         if any(p[2]=="upload order" for p in valid):st.warning("Some files could not be paired from their names and were paired by upload order. Verify the pairing table before exporting.")
@@ -130,9 +141,9 @@ elif upload_mode=="Batch combined export":
         if valid:
             rows=[];errors=[]
             with st.spinner(f"Analyzing {len(valid)} cell pair(s)..."):
-                for t,r,method in valid:
+                for t,r,method,role in valid:
                     try:
-                        label=_batch_key(t.name) or _stem(t.name);batch_meta=Metadata(cell_id=label,condition=condition,cell_type=cell_type,animal_id=animal_id,age=age,sex=sex,notes=notes);test_rec=_load_data(t.getvalue(),t.name,batch_meta,cfg,"test");rheo_rec=_load_data(r.getvalue(),r.name,batch_meta,cfg,"rheobase");tp=_tp(test_rec);props=rheo_rec.properties;props.series_resistance=tp.series_resistance;props.membrane_resistance=tp.membrane_resistance;props.membrane_capacitance=tp.membrane_capacitance;rows.append(_combined_row(label,batch_meta,props,t.name,r.name))
+                        label=_batch_key(t.name) or _stem(t.name);batch_meta=Metadata(cell_id=label,condition=condition,cell_type=cell_type,animal_id=animal_id,age=age,sex=sex,notes=notes);test_rec=_load_data(t.getvalue(),t.name,batch_meta,cfg,"test");rheo_rec=_load_data(r.getvalue(),r.name,batch_meta,cfg,"rheobase");tp=_tp(test_rec);props=rheo_rec.properties;props.series_resistance=tp.series_resistance;props.membrane_resistance=tp.membrane_resistance;props.membrane_capacitance=tp.membrane_capacitance;rows.append(_combined_row(label,batch_meta,props,t.name,r.name,role))
                     except Exception as err:errors.append({"Test Pulse File":t.name,"Rheobase File":r.name,"Error":str(err)})
             if errors:st.error(f"{len(errors)} pair(s) could not be analyzed.");st.dataframe(pd.DataFrame(errors),hide_index=True,use_container_width=True)
             if rows:
