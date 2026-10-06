@@ -57,8 +57,9 @@ def _pair_batch_files(test_files,rheo_files):
             t=pairs[pi][0];pairs[pi]=(t,r,"upload order","Control");used.add(ri)
     return pairs,[r for i,r in enumerate(rheos) if i not in used]
 
-def _combined_row(cell_label,meta,props,test_name,rheo_name):
+def _combined_row(cell_label,meta,props,test_name,rheo_name,experimental_role=None):
     row={"Cell":cell_label,"Type":meta.cell_type,"treatment":meta.condition,"DPI/Age":meta.age,"sex":meta.sex,"Test Pulse File":test_name,"Rheobase File":rheo_name}
+    if experimental_role is not None:row["Experimental Role"]=experimental_role
     row.update(props.to_flat_dict());return row
 
 def _test_pulse_row(cell_label,meta,tp,test_name):
