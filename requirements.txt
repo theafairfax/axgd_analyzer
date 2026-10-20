@@ -4,3 +4,4 @@ pandas
 numpy
 neo
 scipy
+pyabf>=2.3.8,<3

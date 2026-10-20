@@ -83,7 +83,12 @@ def plot_phase_planes(sweeps):
     if sweeps:ax.legend(fontsize="small")
     return fig
 
-st.set_page_config(page_title="AxoGraph Patch-Clamp Analyzer",layout="wide")
+st.set_page_config(page_title="Patch-Clamp Analyzer",layout="wide")
+file_format=st.sidebar.radio("File format",["AXGD","ABF"],horizontal=True,key="file_format")
+if file_format=="ABF":
+    from abf_ui import render_abf_workspace
+    render_abf_workspace()
+    st.stop()
 st.title("AxoGraph (.axgd) Current Clamp Analyzer")
 st.caption("Passive properties come from the dedicated test pulse; intrinsic AP/AHP shape uses only APs generated at rheobase.")
 with st.sidebar:
