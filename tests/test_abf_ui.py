@@ -1,10 +1,11 @@
 import unittest
+from pathlib import Path
 from streamlit.testing.v1 import AppTest
 
 
 class ABFNavigationTests(unittest.TestCase):
     def test_abf_has_three_protocol_tabs(self):
-        app = AppTest.from_file("app.py", default_timeout=30).run()
+        app = AppTest.from_file(str(Path(__file__).resolve().parents[1] / "app.py"), default_timeout=30).run()
         self.assertEqual(len(app.exception), 0)
         app.sidebar.radio[0].set_value("ABF").run()
         self.assertEqual(len(app.exception), 0)
