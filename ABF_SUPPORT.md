@@ -86,7 +86,7 @@ streamlit run app.py
 ```
 
 Tests cover generated ABF1 input/scaling and synthetic AP/AHP trains, window
-selection, missing AHPs, averaging and RMP settling exclusion. Tests and the
-uploaded 0000/0001/0002 recordings could not be executed/inspected in the
-editing session because no execution environment was available. ABF2 sample
-validation and manual Clampfit comparisons remain outstanding.
+selection, missing AHPs, averaging and RMP settling exclusion. Automated syntax and test checks run in GitHub Actions, including a Streamlit
+navigation check for the three ABF tabs. The uploaded 0000/0001/0002 recordings
+could not be inspected because the local execution environment was unavailable.
+ABF2 sample validation and manual Clampfit comparisons remain outstanding.

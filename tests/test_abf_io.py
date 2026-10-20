@@ -13,7 +13,10 @@ from abf_io import ABFTrace, inspect_abf_bytes, load_abf_traces, open_abf, summa
 
 class ABFInputTests(unittest.TestCase):
     def make_abf(self, units):
-        expected = np.array([[-70., -60., -50., -40.], [10., 20., 30., 40.]])
+        expected = np.zeros((2, 10000))
+        # pyABF reads extended ABF1 header offsets beyond its writer\'s
+        # minimal header. Keep those overlapping fixture bytes zero.
+        expected[:, 9000:9004] = [[-70., -60., -50., -40.], [10., 20., 30., 40.]]
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / "test.abf"
             writeABF1(expected, str(path), 10000, units=units)
@@ -31,7 +34,7 @@ class ABFInputTests(unittest.TestCase):
                 self.assertEqual([t.sweep for t in traces], [1, 0])
                 np.testing.assert_allclose(traces[0].values, expected[1], atol=0.01)
                 np.testing.assert_allclose(traces[1].values, expected[0], atol=0.01)
-                np.testing.assert_allclose(traces[0].time, np.arange(4) / 10000)
+                np.testing.assert_allclose(traces[0].time, np.arange(expected.shape[1]) / 10000)
                 self.assertEqual(traces[0].unit, units)
 
     def test_invalid_header_and_selection(self):

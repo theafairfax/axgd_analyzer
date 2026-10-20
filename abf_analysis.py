@@ -104,6 +104,8 @@ def event_averages(rows):
     keys = [f"{block} {metric}" for block in ("SPIKE", "AHP")
             for metric in ("Peak Membrane Voltage-1 (mV)", "Location (ms)",
                            "Onset (ms)", "Rise (ms)", "Width (ms)")]
+    keys += ["Threshold Vm (mV)", "AP amplitude (mV)",
+             "AHP amplitude from threshold (mV)", "AHP trough Vm (mV)"]
     result = []
     for key in keys:
         values = np.array([r[key] for r in rows], dtype=float)
