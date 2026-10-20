@@ -47,6 +47,10 @@ def describe_abf(abf):
         "sweep_count": int(abf.sweepCount),
         "protocol": str(abf.protocol),
         "recorded": str(abf.abfDateTimeString),
+        "commands": [
+            {"channel": int(ch), "name": abf.dacNames[ch], "unit": abf.dacUnits[ch]}
+            for ch in abf.channelList if ch < len(abf.dacNames)
+        ],
         "channels": [
             {"channel": int(ch), "name": abf.adcNames[ch], "unit": abf.adcUnits[ch]}
             for ch in abf.channelList
@@ -100,3 +104,42 @@ def summarize_traces(traces):
             "Peak-to-peak": float(np.ptp(finite)) if len(finite) else None,
         })
     return rows
+
+
+VOLTAGE_SCALES = {"V": 1000., "mV": 1., "uV": .001, "µV": .001, "μV": .001}
+CURRENT_SCALES = {"A": 1e12, "mA": 1e9, "uA": 1e6, "µA": 1e6, "μA": 1e6, "nA": 1e3, "pA": 1.}
+
+
+def load_protocol_sweeps(file_bytes, voltage_channel, current_source="manual", current_channel=None):
+    """Read measured Vm in mV and optional ADC current or DAC command in pA.
+
+    A DAC command is explicitly selected and remains identified as a command.
+    A missing/unsupported command raises rather than substituting a waveform.
+    """
+    with open_abf(file_bytes) as abf:
+        unit = abf.adcUnits[voltage_channel].strip()
+        if unit not in VOLTAGE_SCALES:
+            raise ValueError("Select a voltage channel with V, mV, or uV units.")
+        sweeps = []
+        for index in abf.sweepList:
+            abf.setSweep(index, channel=voltage_channel)
+            t = np.array(abf.sweepX, copy=True)
+            voltage = np.array(abf.sweepY, dtype=float, copy=True) * VOLTAGE_SCALES[unit]
+            current = None
+            if current_source == "ADC":
+                abf.setSweep(index, channel=current_channel)
+                iunit = abf.adcUnits[current_channel].strip()
+                if iunit not in CURRENT_SCALES:
+                    raise ValueError("Selected ADC current channel has unsupported units.")
+                current = np.array(abf.sweepY, dtype=float, copy=True) * CURRENT_SCALES[iunit]
+            elif current_source == "DAC":
+                # pyABF associates sweepC with the currently selected channel's DAC.
+                abf.setSweep(index, channel=current_channel)
+                iunit = str(abf.sweepUnitsC).strip()
+                if iunit not in CURRENT_SCALES:
+                    raise ValueError("Selected command is not in current units; select another source.")
+                current = np.array(abf.sweepC, dtype=float, copy=True) * CURRENT_SCALES[iunit]
+            if current is not None and (len(current) != len(t) or not np.all(np.isfinite(current))):
+                raise ValueError("Current waveform is missing, nonfinite, or differs from voltage length.")
+            sweeps.append({"index": int(index), "time": t, "voltage": voltage, "current": current})
+        return sweeps
