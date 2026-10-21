@@ -40,16 +40,38 @@ sw = dict(time=t, voltage=v, index=0)
 render_event_inspector(sw, analyze_events(t,v,0,.029), 'test')
 ''').run()
         self.assertEqual(len(app.exception), 0)
-        self.assertEqual([tab.label for tab in app.tabs], ['AP spike', 'AHP trough'])
+        self.assertIn('AP spike dynamics', [h.value for h in app.subheader])
+        self.assertIn('AHP dynamics', [h.value for h in app.subheader])
+        self.assertIn('AHP trough Vm (mV)', [m.label for m in app.metric])
+        self.assertIn('AHP amplitude from onset (mV)', [m.label for m in app.metric])
         self.assertEqual(len(app.slider), 12)
         app.slider[0].set_value(10.01)
         next(b for b in app.button if b.label == 'Apply marker adjustments').click().run()
         self.assertEqual(len(app.exception), 0)
         self.assertAlmostEqual(app.dataframe[0].value.iloc[0]['Sweep time (ms)'], 10.01)
+        app.slider[6].set_value(16.01)
+        [b for b in app.button if b.label == 'Apply marker adjustments'][1].click().run()
+        self.assertEqual(len(app.exception), 0)
+        self.assertAlmostEqual(app.dataframe[1].value.iloc[0]['Sweep time (ms)'], 16.01)
+        self.assertAlmostEqual(app.dataframe[1].value.iloc[0]['Relative to location (ms)'], 0.)
         app.radio[0].set_value('Absolute sweep time').run()
         self.assertEqual(len(app.exception), 0)
         next(b for b in app.button if b.label == 'Reset to detected markers').click().run()
         self.assertAlmostEqual(app.dataframe[0].value.iloc[0]['Sweep time (ms)'], 10.)
+
+    def test_unresolved_ahp_keeps_visible_section_and_trace(self):
+        app = AppTest.from_string('''
+import numpy as np
+from abf_analysis import analyze_events
+from abf_waveform import render_event_inspector
+t = np.arange(0., .03, .00001)
+v = np.interp(t*1000, [0,8,10,12,30], [-65,-65,35,-65,-80])
+render_event_inspector(dict(time=t, voltage=v, index=0), analyze_events(t,v,0,.029), 'missing')
+''').run()
+        self.assertEqual(len(app.exception), 0)
+        self.assertIn('AHP dynamics', [h.value for h in app.subheader])
+        self.assertIn('unresolved', app.warning[0].value)
+        self.assertEqual(len(app.get('image')), 2)
 
 
 if __name__ == '__main__':
