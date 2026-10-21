@@ -45,15 +45,17 @@ pyABF associates each command with the corresponding channel index.
 ## Measurement definitions
 
 - AP detection: adjustable peak height, prominence and refractory separation.
-- AP onset: first sample above the chosen dV/dt threshold immediately before
+- AP onset: first sample at or above the chosen dV/dt threshold before
   the maximum upstroke within 5 ms of the peak, after the preceding peak.
 - SPIKE peak: absolute Vm at peak. Separate AP amplitude equals peak minus
-  onset Vm. Rise is onset-to-peak; width is full width at half that amplitude.
+  onset Vm. Rise is the interpolated 10–90% interval; width is full width at half that amplitude.
 - AHP onset: repolarizing AP's downward return through the same onset Vm.
   AHP peak: absolute minimum Vm thereafter. Separate AHP amplitude equals
   trough minus AP onset Vm (negative for hyperpolarization).
-- AHP rise: onset-to-trough. Width: full width at half depth below AP onset Vm.
-- Locations/onsets: sweep-relative ms, not times aligned to the AP peak.
+- AHP rise: downward 10–90% interval from onset Vm toward the trough. Width: full width at half depth below AP onset Vm.
+- Locations/onsets and fractional crossings: absolute sweep ms, plus relative
+  columns centered on each AP peak or AHP trough (location = 0). Rise and
+  width are durations, independent of time origin.
 - AHP windows stop at the next AP onset, injection end or configurable maximum
   post-peak duration (default 50 ms). Truncated/unresolved troughs and widths
   remain missing; missing values never contribute zero to averages.
@@ -90,3 +92,18 @@ selection, missing AHPs, averaging and RMP settling exclusion. Automated syntax 
 navigation check for the three ABF tabs. The uploaded 0000/0001/0002 recordings
 could not be inspected because the local execution environment was unavailable.
 ABF2 sample validation and manual Clampfit comparisons remain outstanding.
+
+## Isolated waveform review
+
+Step and ramp protocols show the first detected AP in the selected sweep in
+separate AP spike and AHP trough views. Colored vertical lines intersect the
+full-resolution waveform at location, onset, 10%, 90%, and both half-amplitude
+crossings. The time axis switches between absolute sweep time and time relative
+to each event's own location. Missing crossings remain unresolved.
+
+Expand **Adjust marker times**, drag the time sliders, and apply to review
+manual landmarks; durations and relative times update from these endpoints.
+These are explicit manual timing overrides, not a new automatic fit. They do
+not change detection or protocol averages. Download the displayed markers CSV
+for the reviewed values, or reset to detected markers. Changes to the file,
+sweep, channel or detection results start a fresh review.
