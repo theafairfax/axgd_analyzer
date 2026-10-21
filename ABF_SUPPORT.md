@@ -96,7 +96,10 @@ ABF2 sample validation and manual Clampfit comparisons remain outstanding.
 ## Isolated waveform review
 
 Step and ramp protocols show the first detected AP in the selected sweep in
-separate AP spike and AHP trough views. Colored vertical lines intersect the
+separate, always-visible AP spike dynamics and AHP dynamics sections.
+The AHP section includes trough voltage, signed amplitude from onset, AP-peak
+to AHP-trough delay, 10–90% rise and half-width. When detection is unresolved,
+it still displays the post-spike search trace, detection status and guidance. Colored vertical lines intersect the
 full-resolution waveform at location, onset, 10%, 90%, and both half-amplitude
 crossings. The time axis switches between absolute sweep time and time relative
 to each event's own location. Missing crossings remain unresolved.

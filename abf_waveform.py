@@ -36,6 +36,29 @@ def landmark_table(values, tm, voltage):
     ])
 
 
+def _unresolved_ahp(row, tm, voltage):
+    st.warning("AHP dynamics are unresolved: " + row.get("Status", "No resolved trough"))
+    lo, hi = row["SPIKE Location (ms)"], row["_Event end (ms)"]
+    mask = (tm >= lo) & (tm <= hi)
+    fig, ax = plt.subplots(figsize=(11, 3.5))
+    try:
+        ax.plot(tm[mask], voltage[mask], color="#1e293b", lw=1.5)
+        threshold = row["Threshold Vm (mV)"]
+        if np.isfinite(threshold):
+            ax.axhline(threshold, color="#7c3aed", ls="--", label="AP onset Vm / AHP baseline")
+            ax.legend(frameon=False)
+        ax.set(xlabel="Time within sweep (ms)", ylabel="Membrane potential (mV)",
+               title="Post-spike AHP search window")
+        ax.grid(alpha=.15)
+        st.pyplot(fig)
+    finally:
+        plt.close(fig)
+    st.caption("AHP onset requires the AP to return below its onset voltage, followed by a "
+               "voltage minimum before the search boundary. Check the trace and try increasing "
+               "‘Maximum AHP search after AP peak (ms)’ or the injection end when appropriate. "
+               "The search also stops at the next AP onset. Unresolved values are left blank.")
+
+
 def render_event_inspector(sweep, rows, prefix):
     if not rows:
         return
@@ -50,11 +73,12 @@ def render_event_inspector(sweep, rows, prefix):
         return
     # Include settings/results in the key so a new detection cannot reuse stale edits.
     signature = hashlib.sha256(json.dumps(row, sort_keys=True).encode()).hexdigest()[:12]
-    for block, tab in zip(("SPIKE", "AHP"), st.tabs(["AP spike", "AHP trough"])):
-        with tab:
+    for block in ("SPIKE", "AHP"):
+        with st.container():
+            st.subheader("AP spike dynamics" if block == "SPIKE" else "AHP dynamics")
             origin = row[f"{block} Location (ms)"]
             if not np.isfinite(origin):
-                st.info("AHP trough is unresolved within the analysis window.")
+                _unresolved_ahp(row, tm, voltage)
                 continue
             lo = row["_Event start (ms)"] if block == "SPIKE" else row["AHP Onset (ms)"]
             hi = row["_Event end (ms)"]
@@ -120,6 +144,17 @@ def render_event_inspector(sweep, rows, prefix):
             st.dataframe(table, hide_index=True, use_container_width=True)
             rise = values["Rise 90%"]-values["Rise 10%"]
             width = values["Half fall"]-values["Half rise"]
+            onset_vm = float(np.interp(values["Onset"], tm, voltage))
+            peak_vm = float(np.interp(values["Location"], tm, voltage))
+            amplitude = peak_vm-onset_vm
+            latency = values["Location"]-row["SPIKE Location (ms)"]
+            if block == "AHP":
+                c, d, e = st.columns(3)
+                c.metric("AHP trough Vm (mV)", f"{peak_vm:.4f}")
+                d.metric("AHP amplitude from onset (mV)", f"{amplitude:.4f}")
+                e.metric("AP peak to AHP trough (ms)", f"{latency:.4f}")
+                st.caption("AHP amplitude = trough Vm − AHP onset Vm (negative for hyperpolarization). "
+                           "Location is the trough; AHP relative timestamps use this trough as zero.")
             a, b = st.columns(2)
             a.metric("Rise 10–90% (ms)", f"{rise:.4f}" if np.isfinite(rise) else "Unresolved")
             b.metric("Width at half amplitude (ms)", f"{width:.4f}" if np.isfinite(width) else "Unresolved")
@@ -131,6 +166,10 @@ def render_event_inspector(sweep, rows, prefix):
             table["Measurement source"] = "Manual override" if reviewed else "Automatic"
             table["Rise 10–90% duration (ms)"] = rise
             table["Half-width duration (ms)"] = width
+            if block == "AHP":
+                table["AHP trough Vm (mV)"] = peak_vm
+                table["AHP amplitude from onset (mV)"] = amplitude
+                table["AP peak to AHP trough (ms)"] = latency
             st.download_button("Download displayed markers CSV", table.to_csv(index=False).encode(),
                                file_name=f"{prefix}_sweep{sweep['index']}_{block}_markers.csv",
                                mime="text/csv", key=key+"_csv")
