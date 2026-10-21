@@ -10,6 +10,7 @@ import streamlit as st
 from abf_io import (inspect_abf_bytes, load_protocol_sweeps,
                     VOLTAGE_SCALES, CURRENT_SCALES)
 from abf_analysis import analyze_events, event_averages, rmp_summary
+from abf_waveform import render_event_inspector
 
 
 @st.cache_data(show_spinner="Reading ABF header...", max_entries=3)
@@ -65,7 +66,8 @@ def _dynamics(rows, prefix, filename):
         return
     averages = pd.DataFrame(event_averages(rows))
     st.dataframe(averages, hide_index=True, use_container_width=True)
-    detail = pd.DataFrame(rows).drop(columns=["Peak sample"])
+    detail = pd.DataFrame(rows)
+    detail = detail.drop(columns=[c for c in detail if c == "Peak sample" or c.startswith("_")])
     with st.expander("Individual events and measurement status", expanded=True):
         st.dataframe(detail, hide_index=True, use_container_width=True)
     averages.insert(0, "File", filename)
@@ -215,6 +217,7 @@ def _protocol(kind):
         idx = st.selectbox("Sweep for average AP/AHP dynamics (0-based)", range(len(sweeps)), key=prefix+"_selected")
         st.write(f"All {len(events[idx])} APs detected during injection in sweep {idx}")
         _plot(sweeps[idx], events[idx], windows[idx])
+        render_event_inspector(sweeps[idx], events[idx], prefix)
         _dynamics(events[idx], prefix, stem+"_sweep"+str(idx))
     else:
         idx = st.selectbox("Ramp sweep (0-based)", range(len(sweeps)), key=prefix+"_ramp_sweep")
@@ -233,6 +236,7 @@ def _protocol(kind):
             rheobase = ramp_start + (ramp_end-ramp_start)*(sw["time"][peak]-lo)/(hi-lo)
         st.metric("Ramp rheobase: current at first AP peak", f"{rheobase:.3f} pA")
         st.caption("Ramp rheobase is the absolute current at the AP peak; it is not baseline-subtracted.")
+        render_event_inspector(sw, rows, prefix)
         _dynamics(rows, prefix, stem+"_ramp_sweep"+str(idx))
         _csv(pd.DataFrame([{"File": upload.name, "Sweep": idx, "Rheobase (pA)": rheobase,
                             "Current source": source}]), "Download ramp rheobase CSV",
@@ -266,11 +270,11 @@ def render_abf_workspace():
     with st.expander("Measurement definitions"):
         st.markdown(
             "Peak voltages are absolute Vm in mV. AP onset is the upward dV/dt threshold "
-            "before the peak; rise is onset-to-peak and width is full width at half amplitude "
+            "before the peak; rise is the 10–90% amplitude interval and width is full width at half amplitude "
             "above onset Vm. AHP onset is the post-AP return below that same Vm; its peak "
-            "is the subsequent voltage minimum. AHP rise is onset-to-trough and width is "
+            "is the subsequent voltage minimum. AHP rise is the downward 10–90% amplitude interval and width is "
             "full width at half depth below onset Vm. Locations/onsets are milliseconds "
-            "from sweep start. AHP searches stop at the next AP onset, injection end, "
+            "from sweep start; relative marker columns subtract each event’s own location. Rise/width are durations. AHP searches stop at the next AP onset, injection end, "
             "or configured search limit. Unresolved measurements remain blank and are "
             "excluded from metric averages; valid-event counts are shown. "
             "Separate columns report AP/AHP amplitudes relative to threshold. "

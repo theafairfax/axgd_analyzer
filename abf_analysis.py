@@ -34,8 +34,8 @@ def analyze_events(t, v, start_s, end_s, height=-10., prominence=20.,
     for peak in peaks:
         lo = max(previous + 1, peak - max(2, int(.005/dt)), 0)
         upstroke = lo + int(np.argmax(dv[lo:peak+1]))
-        below = np.flatnonzero(dv[lo:upstroke+1] < dvdt_threshold)
-        onset = lo + int(below[-1]) + 1 if len(below) and dv[upstroke] >= dvdt_threshold else None
+        above = np.flatnonzero(dv[lo:upstroke+1] >= dvdt_threshold)
+        onset = lo + int(above[0]) if len(above) else None
         onsets.append(onset)
         previous = peak
     rows = []
@@ -67,7 +67,13 @@ def analyze_events(t, v, start_s, end_s, height=-10., prominence=20.,
         left = crossing(tm, v, half, onset, peak, True)
         right = crossing(tm, v, half, peak, stop, False)
         row.update({"SPIKE Onset (ms)": float(tm[onset]),
-                    "SPIKE Rise (ms)": float(tm[peak]-tm[onset]),
+                    "SPIKE Rise (ms)": crossing(tm, v, baseline+.9*(v[peak]-baseline), onset, peak, True)
+                    - crossing(tm, v, baseline+.1*(v[peak]-baseline), onset, peak, True),
+                    "SPIKE Rise 10% (ms)": crossing(tm, v, baseline+.1*(v[peak]-baseline), onset, peak, True),
+                    "SPIKE Rise 90% (ms)": crossing(tm, v, baseline+.9*(v[peak]-baseline), onset, peak, True),
+                    "SPIKE Half rise (ms)": left, "SPIKE Half fall (ms)": right,
+                    "_Event start (ms)": float(tm[max(int(peaks[n-1])+1 if n else 0, peak-max(2, int(.005/dt)))]),
+                    "_Event end (ms)": float(tm[stop]),
                     "SPIKE Width (ms)": right-left,
                     "Threshold Vm (mV)": baseline,
                     "AP amplitude (mV)": float(v[peak]-baseline)})
@@ -91,12 +97,23 @@ def analyze_events(t, v, start_s, end_s, height=-10., prominence=20.,
                         "AHP Peak Membrane Voltage-1 (mV)": float(v[trough]),
                         "AHP Location (ms)": float(tm[trough]),
                         "AHP Onset (ms)": ahp_on,
-                        "AHP Rise (ms)": float(tm[trough]-ahp_on),
+                        "AHP Rise (ms)": crossing(tm, v, baseline+.9*(v[trough]-baseline), max(peak, first-1), trough, False)
+                        - crossing(tm, v, baseline+.1*(v[trough]-baseline), max(peak, first-1), trough, False),
+                        "AHP Rise 10% (ms)": crossing(tm, v, baseline+.1*(v[trough]-baseline), max(peak, first-1), trough, False),
+                        "AHP Rise 90% (ms)": crossing(tm, v, baseline+.9*(v[trough]-baseline), max(peak, first-1), trough, False),
+                        "AHP Half rise (ms)": down, "AHP Half fall (ms)": up,
                         "AHP Width (ms)": up-down,
                         "AHP amplitude from threshold (mV)": float(v[trough]-baseline),
                         "AHP trough Vm (mV)": float(v[trough])})
                     row["Status"] = "OK" if np.isfinite(up) else "AHP half-recovery truncated; width unavailable"
         rows.append(row)
+    for row in rows:
+        for block in ("SPIKE", "AHP"):
+            origin = row[block+" Location (ms)"]
+            for label in ("Location", "Onset", "Rise 10%", "Rise 90%", "Half rise", "Half fall"):
+                key = f"{block} {label} (ms)"
+                row.setdefault(key, np.nan)
+                row[f"{block} {label} relative (ms)"] = row[key]-origin
     return rows
 
 
